@@ -19,6 +19,7 @@ export type PromptAttachment = {
 };
 
 const TEXT_ATTACHMENT_CHAR_LIMIT = 60_000;
+const IMAGE_ATTACHMENT_PROVIDER_BYTE_LIMIT = 6 * 1024 * 1024;
 const TEXT_ATTACHMENT_EXTENSIONS = new Set([
   "csv",
   "json",
@@ -34,6 +35,10 @@ const TEXT_ATTACHMENT_EXTENSIONS = new Set([
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+export function shouldAbortOnPassiveGenerationDisconnect(args: { chatMode: string; impersonate?: boolean }): boolean {
+  return args.chatMode !== "conversation" || args.impersonate === true;
 }
 
 export function mergeCustomParameters(
@@ -76,6 +81,59 @@ export function isMessageHiddenFromAI(message: { extra?: unknown }): boolean {
   return parseExtra(message.extra).hiddenFromAI === true;
 }
 
+export function shouldPreferLatestVisibleGameState(input: {
+  attachments?: unknown[] | null;
+  impersonate?: boolean;
+  regenerateMessageId?: string | null;
+  userMessage?: string | null;
+}): boolean {
+  if (input.impersonate === true || !!input.regenerateMessageId) return true;
+  return !input.userMessage?.trim() && !input.attachments?.length;
+}
+
+export function resolveVisibleGameStateAnchor(
+  messages: Array<{ role?: unknown; id?: unknown; activeSwipeIndex?: unknown }>,
+): { messageId: string; swipeIndex: number } | null {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!;
+    if (message.role !== "assistant" || typeof message.id !== "string" || !message.id) continue;
+    const swipeIndex =
+      typeof message.activeSwipeIndex === "number" &&
+      Number.isInteger(message.activeSwipeIndex) &&
+      message.activeSwipeIndex >= 0
+        ? message.activeSwipeIndex
+        : 0;
+    return { messageId: message.id, swipeIndex };
+  }
+  return null;
+}
+
+export function resolveRegenerationGameStateAnchor(
+  messages: Array<{ role?: unknown; id?: unknown; activeSwipeIndex?: unknown }>,
+  regenerateMessageId: string | null | undefined,
+): { messageId: string; swipeIndex: number } | null {
+  if (!regenerateMessageId) return resolveVisibleGameStateAnchor(messages);
+  const targetIndex = messages.findIndex((message) => message.id === regenerateMessageId);
+  if (targetIndex < 0) return resolveVisibleGameStateAnchor(messages);
+  return resolveVisibleGameStateAnchor(messages.slice(0, targetIndex));
+}
+
+export function resolveRegenerationGameStateFallbackMessageIds(
+  messages: Array<{ role?: unknown; id?: unknown }>,
+  regenerateMessageId: string | null | undefined,
+): string[] | null {
+  if (!regenerateMessageId) return null;
+  const targetIndex = messages.findIndex((message) => message.id === regenerateMessageId);
+  const boundedMessages = targetIndex >= 0 ? messages.slice(0, targetIndex) : messages;
+  const ids = new Set<string>([""]);
+  for (const message of boundedMessages) {
+    if (message.role === "assistant" && typeof message.id === "string") {
+      ids.add(message.id);
+    }
+  }
+  return Array.from(ids);
+}
+
 export function getAttachmentFilename(attachment: PromptAttachment): string {
   const rawName = attachment.filename ?? attachment.name;
   return typeof rawName === "string" && rawName.trim() ? rawName.trim() : "attachment";
@@ -85,7 +143,26 @@ export function extractImageAttachmentDataUrls(attachments: PromptAttachment[] |
   return (attachments ?? [])
     .filter((attachment) => typeof attachment.type === "string" && attachment.type.startsWith("image/"))
     .map((attachment) => attachment.data)
-    .filter((data): data is string => typeof data === "string" && data.length > 0);
+    .filter((data): data is string => typeof data === "string" && data.length > 0)
+    .filter((data) => estimateDataUrlBytes(data) <= IMAGE_ATTACHMENT_PROVIDER_BYTE_LIMIT);
+}
+
+function estimateDataUrlBytes(dataUrl: string): number {
+  const commaIndex = dataUrl.indexOf(",");
+  if (!dataUrl.startsWith("data:") || commaIndex < 0) return Buffer.byteLength(dataUrl, "utf8");
+
+  const meta = dataUrl.slice(0, commaIndex).toLowerCase();
+  const payload = dataUrl.slice(commaIndex + 1);
+  if (!meta.includes(";base64")) {
+    try {
+      return Buffer.byteLength(decodeURIComponent(payload), "utf8");
+    } catch {
+      return Buffer.byteLength(payload, "utf8");
+    }
+  }
+
+  const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((payload.length * 3) / 4) - padding);
 }
 
 function isReadableTextAttachment(attachment: PromptAttachment): boolean {
@@ -161,10 +238,11 @@ export function appendReadableAttachmentsToContent(
 /** Resolve the base URL for a connection, falling back to the provider default. */
 export function resolveBaseUrl(connection: { baseUrl: string | null; provider: string }): string {
   if (connection.baseUrl) return connection.baseUrl.replace(/\/+$/, "");
-  // Claude (Subscription) routes through the local Claude Agent SDK and has no
-  // HTTP endpoint — but downstream callers gate on a non-empty baseUrl. Return
-  // a sentinel so the gate passes; the provider ignores the value.
+  // Subscription/login-backed providers own their endpoint internally, but
+  // downstream callers gate on a non-empty baseUrl. Return a sentinel so the
+  // gate passes; the provider ignores the value.
   if (connection.provider === "claude_subscription") return "claude-agent-sdk://local";
+  if (connection.provider === "openai_chatgpt") return "openai-chatgpt://codex-auth";
   const providerDef = PROVIDERS[connection.provider as keyof typeof PROVIDERS];
   return providerDef?.defaultBaseUrl ?? "";
 }
@@ -181,6 +259,16 @@ export function shouldEnableAgentsForGeneration({
   impersonateBlockAgents: boolean;
 }): boolean {
   return chatEnableAgents && chatMode !== "conversation" && !(impersonate && impersonateBlockAgents);
+}
+
+export function shouldInjectIdentityFallback({
+  chatMode,
+  presetId,
+}: {
+  chatMode: string;
+  presetId: string | null | undefined;
+}): boolean {
+  return chatMode !== "game" && !presetId;
 }
 
 /** Parse connection/chat stored generation parameters without injecting schema defaults. */
@@ -282,6 +370,44 @@ export function wrapFields(
     if (value) parts.push(wrapContent(value, name, format, 2));
   }
   return parts;
+}
+
+function trackerCharacterKey(character: Record<string, unknown>) {
+  const id = typeof character.characterId === "string" ? character.characterId.trim().toLowerCase() : "";
+  const name = typeof character.name === "string" ? character.name.trim().toLowerCase() : "";
+  return id || name || null;
+}
+
+export function preserveTrackerCharacterUiFields(
+  nextCharacters: Array<Record<string, unknown>>,
+  previousCharacters: Array<Record<string, unknown>>,
+): void {
+  const previousByKey = new Map<string, Record<string, unknown>>();
+  for (const character of previousCharacters) {
+    const key = trackerCharacterKey(character);
+    if (key) previousByKey.set(key, character);
+  }
+
+  for (const character of nextCharacters) {
+    const key = trackerCharacterKey(character);
+    const previous = key ? previousByKey.get(key) : null;
+    const previousPortraitFocusX = previous?.portraitFocusX;
+    const previousPortraitFocusY = previous?.portraitFocusY;
+    if (
+      typeof character.portraitFocusX !== "number" &&
+      typeof previousPortraitFocusX === "number" &&
+      Number.isFinite(previousPortraitFocusX)
+    ) {
+      character.portraitFocusX = previousPortraitFocusX;
+    }
+    if (
+      typeof character.portraitFocusY !== "number" &&
+      typeof previousPortraitFocusY === "number" &&
+      Number.isFinite(previousPortraitFocusY)
+    ) {
+      character.portraitFocusY = previousPortraitFocusY;
+    }
+  }
 }
 
 /** Parse game state JSON fields from a DB row. */

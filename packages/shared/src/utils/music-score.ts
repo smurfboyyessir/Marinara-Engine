@@ -131,9 +131,9 @@ const WEATHER_AMBIENT: Record<string, string[]> = {
   clear: ["birds", "wind", "water"],
   cloudy: ["wind"],
   overcast: ["wind", "eerie"],
-  rain: ["rain", "thunder"],
-  rainy: ["rain", "thunder"],
-  heavy_rain: ["rain", "thunder", "howling"],
+  rain: ["rain"],
+  rainy: ["rain"],
+  heavy_rain: ["rain", "howling"],
   storm: ["rain", "thunder", "howling"],
   stormy: ["rain", "thunder", "howling"],
   snow: ["wind", "howling"],
@@ -360,18 +360,17 @@ export function scoreMusic(input: MusicScoreInput): string | null {
     score: scoreStructuredMusic(candidate, desiredGenre, desiredIntensity, hasExactGenre, weather, timeOfDay),
   }));
 
-  const bestScore = Math.max(...scored.map((entry) => entry.score));
-  const currentScore = currentMusic ? scored.find((entry) => entry.tag === currentMusic)?.score : undefined;
-  if (currentScore !== undefined && currentScore >= bestScore - 1) return null;
-
   const recentSet = new Set((recentMusic ?? []).filter((tag) => tag && tag !== currentMusic));
   const nonCurrent = scored.filter((entry) => entry.tag !== currentMusic);
   const nonRecent = nonCurrent.filter((entry) => !recentSet.has(entry.tag));
   const poolBase = nonRecent.length > 0 ? nonRecent : nonCurrent.length > 0 ? nonCurrent : scored;
   if (!poolBase.length) return null;
 
+  const bestScore = Math.max(...scored.map((entry) => entry.score));
+  const currentScore = currentMusic ? scored.find((entry) => entry.tag === currentMusic)?.score : undefined;
   const poolBestScore = Math.max(...poolBase.map((entry) => entry.score));
-  const selectionPool = poolBase.filter((entry) => entry.score >= poolBestScore - 1);
+  const rotationWindow = currentScore !== undefined && currentScore >= bestScore - 1 ? 8 : 1;
+  const selectionPool = poolBase.filter((entry) => entry.score >= poolBestScore - rotationWindow);
   return pickRandom(selectionPool).tag;
 }
 
@@ -393,6 +392,17 @@ function ambientKeywordScore(parts: string[], keywords: string[]): number {
     if (parts.some((part) => part.includes(kw) || kw.includes(part))) score++;
   }
   return score;
+}
+
+function weatherAllowsStormAudio(weather?: string | null): boolean {
+  const normalized = normalizeToken(weather);
+  return normalized === "storm" || normalized === "stormy" || normalized === "thunderstorm";
+}
+
+function ambientStormAudioScore(parts: string[], weather?: string | null): number {
+  const hasStormAudio = parts.includes("thunder") || parts.includes("lightning") || parts.includes("storm");
+  if (!hasStormAudio) return 0;
+  return weatherAllowsStormAudio(weather) ? 2 : -6;
 }
 
 function ambientLocationScore(parts: string[], locationKind: LocationKind | null): number {
@@ -447,7 +457,10 @@ export function scoreAmbient(input: AmbientScoreInput): string | null {
       .toLowerCase()
       .split(/[:\-_]+/)
       .filter((part) => part.length > 1);
-    const score = ambientLocationScore(parts, locationKind) + ambientKeywordScore(parts, keywords);
+    const score =
+      ambientLocationScore(parts, locationKind) +
+      ambientKeywordScore(parts, keywords) +
+      ambientStormAudioScore(parts, weather);
     return { tag, score };
   });
 

@@ -2,6 +2,8 @@
 // Chat & Message Types
 // ──────────────────────────────────────────────
 
+import type { GenerationGuideSource } from "../utils/generation-guide.js";
+
 /** The four primary chat modes the engine supports. */
 export type ChatMode = "conversation" | "roleplay" | "visual_novel" | "game";
 
@@ -75,6 +77,41 @@ export interface WeekSummaryEntry {
   keyDetails: string[];
 }
 
+/** A chat-scoped prompt template used by manual rolling summary generation. */
+export interface ChatSummaryPromptTemplate {
+  id: string;
+  name: string;
+  prompt: string;
+}
+
+/** Rolling summary entry category. Extensible beyond rolling summaries later. */
+export type ChatSummaryEntryKind = "rolling";
+
+/** Whether a rolling summary entry was user-created, agent-created, or migrated from the legacy blob. */
+export type ChatSummaryEntryOrigin = "manual" | "automated" | "legacy";
+
+/** Source selector used to create a rolling summary entry. */
+export type ChatSummaryEntrySource = "last" | "range" | "agent";
+
+/** A single structured rolling chat summary entry. */
+export interface ChatSummaryEntry {
+  id: string;
+  kind: ChatSummaryEntryKind;
+  origin: ChatSummaryEntryOrigin;
+  title: string;
+  content: string;
+  enabled: boolean;
+  sourceMode: ChatSummaryEntrySource;
+  messageCount?: number;
+  rangeStartIndex?: number;
+  rangeEndIndex?: number;
+  messageIds?: string[];
+  promptTemplateId?: string | null;
+  tokenEstimate: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** A vectorized recall fragment created from one chat's messages. */
 export interface ChatMemoryChunk {
   id: string;
@@ -86,12 +123,22 @@ export interface ChatMemoryChunk {
   createdAt: string;
   /** False when chunking succeeded but embedding generation was unavailable. */
   hasEmbedding: boolean;
+  /** Current vectorization state for display. */
+  embeddingStatus?: "vectorized" | "pending" | "unavailable";
 }
 
 /** Extra metadata stored on a chat. */
 export interface ChatMetadata {
-  /** Summary text for context injection */
+  /** Compiled enabled rolling summary text for context injection. Derived from summaryEntries when present. */
   summary: string | null;
+  /** Structured rolling summary entries. Missing means legacy summary-only metadata. */
+  summaryEntries?: ChatSummaryEntry[];
+  /** Recent message count used by manual rolling summary generation and the automated summary agent. */
+  summaryContextSize?: number;
+  /** Chat-scoped manual summary prompt templates. Missing or empty uses the built-in default. */
+  summaryPromptTemplates?: ChatSummaryPromptTemplate[];
+  /** Selected manual summary prompt template ID. Null/omitted uses the built-in default. */
+  activeSummaryPromptTemplateId?: string | null;
   /** Custom tags for organisation */
   tags: string[];
   /** Whether agents are enabled for this chat */
@@ -108,6 +155,8 @@ export interface ChatMetadata {
   activeToolIds: string[];
   /** Per-chat variable selections for preset variables (variableName → value or values) */
   presetChoices: Record<string, string | string[]>;
+  /** Chat-wide string variables persisted by agent tool calls (key → value). */
+  agentVariables?: Record<string, string>;
   /** Group chat mode: "merged" (narrator) or "individual" (separate characters) */
   groupChatMode?: GroupChatMode;
   /** Group individual mode: color dialogues with speaker tags */
@@ -116,6 +165,8 @@ export interface ChatMetadata {
   groupResponseOrder?: GroupResponseOrder;
   /** Characters with visible roleplay sprites enabled for this chat. */
   spriteCharacterIds?: string[];
+  /** Which sprite file families the roleplay Expression Engine may display. */
+  spriteDisplayModes?: Array<"expressions" | "full-body">;
   /** Preferred sidebar / default layout side for chat sprites. */
   spritePosition?: SpriteSide;
   /** Display scale for roleplay Expression Engine sprites. */
@@ -141,6 +192,10 @@ export interface ChatMetadata {
   /** Per-chat ephemeral / enabled overrides for lorebook entries (entryId → state).
    *  Tracked per-chat so ephemeral countdown in one chat doesn't affect others. */
   entryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
+  /** Per-chat sticky/cooldown/delay runtime state for lorebook entries. */
+  entryTimingStates?: Record<string, import("./lorebook.js").LorebookEntryTimingState>;
+  /** Per-chat global lorebook token budget. Missing uses app default; 0 means unlimited. */
+  lorebookTokenBudget?: number | null;
   /** ID of the chat preset most recently applied to this chat (drives the preset bar dropdown). */
   appliedChatPresetId?: string | null;
   /** Custom prompt prefix used by the /impersonate slash command. */
@@ -149,14 +204,30 @@ export interface ChatMetadata {
   showInputTranslateButton?: boolean;
   /** Allow roleplay characters to create direct-message conversation chats with hidden [dm] commands. */
   roleplayDmCommandsEnabled?: boolean;
+  /** Chat-scoped Intiface Central WebSocket URL for haptic manual and auto-connect. */
+  hapticIntifaceUrl?: string | null;
+  /** Durable count of autonomous messages the user has not viewed yet. */
+  autonomousUnreadCount?: number;
+  /** Character IDs that contributed to the current autonomous unread state. */
+  autonomousUnreadCharacterIds?: string[];
+  /** Timestamp of the newest autonomous unread message. */
+  autonomousUnreadAt?: string | null;
 
   // ── Conversation Mode Fields ──
   /** Whether conversation character schedules are enabled for this chat. */
   conversationSchedulesEnabled?: boolean;
+  /** Allow conversation characters to use hidden command tags. Default: true. */
+  characterCommands?: boolean;
   /** Chat-scoped generated schedules for conversation characters. */
   characterSchedules?: Record<string, unknown>;
   /** Week start timestamp for the current generated conversation schedules. */
   scheduleWeekStart?: string;
+  /** Chat-scoped selfie prompt-builder template. Empty/null uses the global/default prompt. */
+  selfiePrompt?: string | null;
+  /** Extra positive prompt/tags appended to generated conversation selfie prompts. */
+  selfiePositivePrompt?: string;
+  /** Extra negative prompt/tags sent with generated conversation selfies. */
+  selfieNegativePrompt?: string;
 
   // ── Game Mode Fields ──
   /** UUID linking all sessions of one game */
@@ -165,6 +236,8 @@ export interface ChatMetadata {
   gameSessionNumber?: number;
   /** Current session lifecycle status */
   gameSessionStatus?: import("./game.js").GameSessionStatus;
+  /** Whether the first game intro screen has been dismissed for this game chat. */
+  gameIntroPresented?: boolean;
   /** Timestamp for when the current game session was created/started */
   gameCurrentSessionStartedAt?: string;
   /** Current game state (exploration, dialogue, combat, travel_rest) */
@@ -193,6 +266,8 @@ export interface ChatMetadata {
   gameDialogueChatId?: string | null;
   /** Active combat sub-scene chat ID */
   gameCombatChatId?: string | null;
+  /** Live combat encounter snapshot — restored on page refresh while a fight is in progress. */
+  gameCombatState?: import("./game.js").GameCombatStateSnapshot | null;
   /** User's initial game setup preferences */
   gameSetupConfig?: import("./game.js").GameSetupConfig | null;
   /** Tracked NPCs with reputation */
@@ -203,6 +278,20 @@ export interface ChatMetadata {
   gameLastIllustrationSessionNumber?: number | null;
   /** Background tag for the last rare generated scene illustration. */
   gameLastIllustrationTag?: string;
+  /** Extra user instructions for game scene illustration prompts. */
+  gameImagePromptInstructions?: string | null;
+  /** Per-game asset browser folder exclusions. Omitted/null means every asset folder is available. */
+  gameAssetSelection?: { excludedFolders?: string[] } | null;
+  /** When true, Game Mode uses Spotify DJ for music instead of local music assets. */
+  gameUseSpotifyMusic?: boolean;
+  /** Music source constraint for Spotify DJ in Game Mode. */
+  gameSpotifySourceType?: "liked" | "playlist" | "artist" | "any";
+  /** Spotify playlist ID used when gameSpotifySourceType is "playlist". */
+  gameSpotifyPlaylistId?: string | null;
+  /** Human-readable playlist name cached for prompts/display. */
+  gameSpotifyPlaylistName?: string | null;
+  /** Spotify artist name used when gameSpotifySourceType is "artist". */
+  gameSpotifyArtist?: string | null;
   /** Run Game Lorebook Keeper after a session is concluded. */
   gameLorebookKeeperEnabled?: boolean;
   /** Chat-scoped lorebook maintained by Game Lorebook Keeper. */
@@ -282,6 +371,8 @@ export interface MessageExtra {
     personaId: string;
     name: string;
     avatarUrl?: string | null;
+    /** JSON-encoded AvatarCrop captured at send time so re-edits don't restyle past messages. */
+    avatarCrop?: string | null;
     nameColor?: string | null;
     dialogueColor?: string | null;
     boxColor?: string | null;
@@ -294,7 +385,21 @@ export interface MessageExtra {
    * Cached pipeline injections (prose-guardian, director, knowledge-retrieval, etc.)
    * saved with this assistant message — reused when regenerating that swipe unless refreshed.
    */
-  contextInjections?: Array<{ agentType: string; text: string }> | null;
+  contextInjections?: Array<{ agentType: string; agentName?: string; text: string }> | null;
+  /**
+   * Hidden command-generation options needed to make swipes/regenerations replay
+   * the same slash-command or guided-regenerate prompt behavior.
+   */
+  generationReplay?: {
+    impersonate?: true;
+    userMessage?: string | null;
+    generationGuide?: string | null;
+    generationGuideSource?: GenerationGuideSource | null;
+    impersonatePresetId?: string | null;
+    impersonateConnectionId?: string | null;
+    impersonateBlockAgents?: boolean;
+    impersonatePromptTemplate?: string | null;
+  } | null;
 }
 
 /** Metadata about how a message was generated. */

@@ -5,10 +5,15 @@
 // assembler. Keeps card macros and depth prompts consistent everywhere.
 // ──────────────────────────────────────────────
 
-import type { CharacterData, MacroContext } from "@marinara-engine/shared";
-import { resolveMacros } from "@marinara-engine/shared";
+import {
+  resolveMacros,
+  type CharacterData,
+  type MacroContext,
+  type ResolveMacroOptions,
+} from "@marinara-engine/shared";
 import type { DB } from "../../db/connection.js";
 import { createCharactersStorage } from "../storage/characters.storage.js";
+import { getCharacterDescriptionWithExtensions } from "./character-description-extensions.js";
 
 type PersonaFields = NonNullable<MacroContext["personaFields"]>;
 
@@ -29,6 +34,34 @@ export interface CharacterMacroData {
   names: string[];
   profiles: NonNullable<MacroContext["characterProfiles"]>;
   primaryFields?: NonNullable<MacroContext["characterFields"]>;
+}
+
+export interface MacroResolutionTransaction {
+  content: string;
+  commit: () => void;
+  rollback: () => void;
+}
+
+export function resolveMacrosWithVariableSnapshot(
+  template: string,
+  macroCtx: MacroContext,
+  options?: ResolveMacroOptions,
+): MacroResolutionTransaction {
+  const before = { ...macroCtx.variables };
+  const content = resolveMacros(template, macroCtx, options);
+  let settled = false;
+
+  const rollback = () => {
+    if (settled) return;
+    macroCtx.variables = before;
+    settled = true;
+  };
+
+  const commit = () => {
+    settled = true;
+  };
+
+  return { content, commit, rollback };
 }
 
 export type PromptDepthEntry = {
@@ -65,14 +98,17 @@ export async function resolveCharacterMacroData(db: DB, characterIds: string[]):
 
     if (data.name) names.push(data.name);
 
+    const description = getCharacterDescriptionWithExtensions(data);
     const profile = {
       name: data.name ?? "Character",
-      description: data.description ?? "",
+      description,
       personality: data.personality ?? "",
       backstory: data.extensions?.backstory ?? "",
       appearance: data.extensions?.appearance ?? "",
       scenario: data.scenario ?? "",
       example: data.mes_example ?? "",
+      systemPrompt: data.system_prompt ?? "",
+      postHistoryInstructions: data.post_history_instructions ?? "",
     };
 
     profiles.push(profile);
@@ -85,6 +121,8 @@ export async function resolveCharacterMacroData(db: DB, characterIds: string[]):
         appearance: profile.appearance,
         scenario: profile.scenario,
         example: profile.example,
+        systemPrompt: profile.systemPrompt,
+        postHistoryInstructions: profile.postHistoryInstructions,
       };
     }
   }
@@ -151,12 +189,14 @@ export async function collectCharacterDepthPromptEntries(
       ...macroCtx,
       char: data?.name ?? macroCtx.char,
       characterFields: {
-        description: data?.description ?? "",
+        description: data ? getCharacterDescriptionWithExtensions(data) : "",
         personality: data?.personality ?? "",
         backstory: data?.extensions?.backstory ?? "",
         appearance: data?.extensions?.appearance ?? "",
         scenario: data?.scenario ?? "",
         example: data?.mes_example ?? "",
+        systemPrompt: data?.system_prompt ?? "",
+        postHistoryInstructions: data?.post_history_instructions ?? "",
       },
     });
 

@@ -44,6 +44,8 @@ export const personas = sqliteTable("personas", {
   backstory: text("backstory").notNull().default(""),
   appearance: text("appearance").notNull().default(""),
   avatarPath: text("avatar_path"),
+  /** Avatar zoom/position settings (JSON of { zoom, offsetX, offsetY, fullImage? }). Empty string = unset. */
+  avatarCrop: text("avatar_crop").notNull().default(""),
   isActive: text("is_active").notNull().default("false"),
   /** Name display color/gradient (CSS value) */
   nameColor: text("name_color").notNull().default(""),
@@ -51,12 +53,16 @@ export const personas = sqliteTable("personas", {
   dialogueColor: text("dialogue_color").notNull().default(""),
   /** Chat bubble background color */
   boxColor: text("box_color").notNull().default(""),
+  /** Tracker card color source + optional custom palette (JSON) */
+  trackerCardColors: text("tracker_card_colors").notNull().default('{"mode":"chat"}'),
   /** Persona stats config (JSON) */
   personaStats: text("persona_stats").notNull().default(""),
   /** Alternative descriptions (JSON array of {id, label, content, active}) */
   altDescriptions: text("alt_descriptions").notNull().default("[]"),
   /** Tags for organizing personas (JSON array of strings) */
   tags: text("tags").notNull().default("[]"),
+  /** Saved Conversation mode activity/status text options (JSON array of strings) */
+  savedStatusOptions: text("saved_status_options").notNull().default("[]"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });

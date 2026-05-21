@@ -5,9 +5,97 @@ import type { FastifyInstance } from "fastify";
 import { MODEL_LISTS, createConnectionSchema, inferImageSource } from "@marinara-engine/shared";
 import { createConnectionsStorage } from "../services/storage/connections.storage.js";
 import { createLLMProvider } from "../services/llm/provider-registry.js";
+import { fetchOpenAIChatGPTModels, getOpenAIChatGPTAuth } from "../services/llm/openai-chatgpt-auth.js";
+import { buildGoogleVertexModelUrl, googleAuthHeadersForVertex } from "../services/llm/providers/google.provider.js";
 import { resolveConnectionImageDefaults } from "../services/image/image-generation-defaults.js";
 import { isImageLocalUrlsEnabled, isProviderLocalUrlsEnabled } from "../config/runtime-config.js";
+import { logDebugOverride } from "../lib/logger.js";
 import { normalizeLoopbackUrl, safeFetch } from "../utils/security.js";
+
+const CONNECTION_TEST_ERROR_PREVIEW_CHARS = 2000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function readDebugMode(body: unknown): boolean {
+  return isRecord(body) && body.debugMode === true;
+}
+
+function trimProviderError(value: string, maxLen = CONNECTION_TEST_ERROR_PREVIEW_CHARS): string {
+  return value.trim().replace(/\s+/g, " ").slice(0, maxLen);
+}
+
+function providerJsonMessage(json: unknown): string | null {
+  if (!isRecord(json)) return null;
+
+  const nestedError = json.error;
+  const message =
+    (isRecord(nestedError) && typeof nestedError.message === "string" && nestedError.message) ||
+    (typeof nestedError === "string" && nestedError) ||
+    (typeof json.message === "string" && json.message) ||
+    (typeof json.detail === "string" && json.detail) ||
+    null;
+
+  if (!message) return null;
+
+  const markers = [
+    typeof json.type === "string" ? `type: ${json.type}` : null,
+    typeof json.code === "string" && json.code !== json.type ? `code: ${json.code}` : null,
+  ].filter(Boolean);
+
+  return markers.length > 0 ? `${message} (${markers.join(", ")})` : message;
+}
+
+function formatProviderErrorBody(body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return "No response body";
+
+  if (/<(?:!doctype|html)\b/i.test(trimmed)) {
+    const titleMatch = trimmed.match(/<title[^>]*>(.*?)<\/title>/i);
+    if (titleMatch?.[1]) return trimProviderError(titleMatch[1]);
+    return trimProviderError(trimmed.replace(/<[^>]+>/g, " "));
+  }
+
+  try {
+    const json = JSON.parse(trimmed) as unknown;
+    const message = providerJsonMessage(json);
+    if (message) return trimProviderError(message);
+  } catch {
+    // Raw text response; fall through to preview.
+  }
+
+  return trimProviderError(trimmed);
+}
+
+function isOpenAICompatibleProvider(provider: string): boolean {
+  return ["openai", "openrouter", "nanogpt", "xai", "mistral", "custom", "cohere"].includes(provider);
+}
+
+function usesResponsesEndpointForTestMessage(provider: string, model: string): boolean {
+  if (!isOpenAICompatibleProvider(provider) || provider === "custom") return false;
+  const normalized = model.toLowerCase();
+  return (
+    normalized.startsWith("gpt-5.5") ||
+    normalized.startsWith("gpt-5.4") ||
+    normalized.startsWith("codex-") ||
+    normalized.endsWith("-codex") ||
+    normalized.endsWith("-codex-max") ||
+    normalized.endsWith("-codex-mini")
+  );
+}
+
+function describeTestMessageTarget(provider: string, baseUrl: string, model: string): string {
+  if (provider === "claude_subscription") return "Claude Agent SDK";
+  if (provider === "openai_chatgpt") return "local ChatGPT session";
+  if (!baseUrl) return "(no base URL)";
+  if (provider === "google_vertex") return buildGoogleVertexModelUrl(baseUrl, model, "generateContent");
+  if (isOpenAICompatibleProvider(provider)) {
+    return `${baseUrl}${usesResponsesEndpointForTestMessage(provider, model) ? "/responses" : "/chat/completions"}`;
+  }
+  if (provider === "anthropic") return `${baseUrl}/messages`;
+  return baseUrl;
+}
 
 function resolveImageGenerationSource(conn: Record<string, unknown>, baseUrl: string): string {
   const explicitSource = typeof conn.imageGenerationSource === "string" ? conn.imageGenerationSource : "";
@@ -18,13 +106,13 @@ function resolveImageGenerationSource(conn: Record<string, unknown>, baseUrl: st
 function localUrlPolicyForProvider(provider: string, imageSource: string) {
   const isLocalImageBackend =
     provider === "image_generation" && (imageSource === "comfyui" || imageSource === "automatic1111");
+  const isImage = provider === "image_generation";
   return {
-    allowLocal:
-      isLocalImageBackend || (provider === "image_generation" && isImageLocalUrlsEnabled())
-        ? true
-        : isProviderLocalUrlsEnabled(),
+    allowLocal: isLocalImageBackend || (isImage && isImageLocalUrlsEnabled()) ? true : isProviderLocalUrlsEnabled(),
     allowLoopback: true,
+    allowMdns: provider !== "image_generation" || isLocalImageBackend || isImageLocalUrlsEnabled(),
     allowedProtocols: ["https:", "http:"],
+    flagName: isImage ? "IMAGE_LOCAL_URLS_ENABLED" : "PROVIDER_LOCAL_URLS_ENABLED",
   };
 }
 
@@ -50,6 +138,30 @@ function buildStabilityUrl(baseUrl: string, targetPath: string): string {
   } catch {
     return `${baseUrl.replace(/\/+$/, "")}/${targetPath.replace(/^\/+/, "")}`;
   }
+}
+
+function buildHordeUrl(baseUrl: string, targetPath: string): string {
+  try {
+    const url = new URL(baseUrl);
+    const parts = url.pathname.split("/").filter(Boolean);
+    const versionIndex = parts.findIndex((part, index) => part === "api" && parts[index + 1] === "v2");
+    const prefix = versionIndex >= 0 ? parts.slice(0, versionIndex + 2) : [...parts, "api", "v2"];
+    url.pathname = `/${[...prefix, ...targetPath.split("/").filter(Boolean)].join("/")}`;
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return `${baseUrl.replace(/\/+$/, "")}/api/v2/${targetPath.replace(/^\/+/, "")}`;
+  }
+}
+
+function hordeHeaders(apiKey: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    apikey: apiKey.trim() || "0000000000",
+    "Client-Agent": "Marinara-Engine",
+  };
 }
 
 function isStabilityV1Base(baseUrl: string): boolean {
@@ -124,6 +236,8 @@ export async function connectionsRoutes(app: FastifyInstance) {
     const conn = await storage.getWithKey(req.params.id);
     if (!conn) return reply.status(404).send({ error: "Connection not found" });
 
+    const requestDebug = readDebugMode(req.body);
+    const debugLog = (message: string, ...args: any[]) => logDebugOverride(requestDebug, message, ...args);
     const start = Date.now();
     try {
       // Claude (Subscription) has no HTTP endpoint — verify the local SDK
@@ -142,6 +256,17 @@ export async function connectionsRoutes(app: FastifyInstance) {
         return {
           success: true,
           message: "Claude Agent SDK loaded. The first chat will fail if `claude login` has not been run on this host.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      }
+
+      if (conn.provider === "openai_chatgpt") {
+        const auth = await getOpenAIChatGPTAuth();
+        const detail = auth.planType ? ` (${auth.planType})` : "";
+        return {
+          success: true,
+          message: `ChatGPT login found via Codex auth${detail}. Requests will use the local ChatGPT session.`,
           latencyMs: Date.now() - start,
           modelName: conn.model,
         };
@@ -167,6 +292,9 @@ export async function connectionsRoutes(app: FastifyInstance) {
       if (provider?.apiKeyHeader) {
         headers[provider.apiKeyHeader] = conn.apiKey;
       }
+      if (conn.provider === "google_vertex") {
+        Object.assign(headers, await googleAuthHeadersForVertex(conn.apiKey));
+      }
 
       const imageSource =
         conn.provider === "image_generation" ? resolveImageGenerationSource(conn as any, baseUrl) : "";
@@ -176,6 +304,9 @@ export async function connectionsRoutes(app: FastifyInstance) {
       if (conn.provider === "image_generation" && imageSource === "novelai") {
         // NovelAI: validate the API key via the user subscription endpoint
         testUrl = "https://api.novelai.net/user/subscription";
+      } else if (conn.provider === "image_generation" && imageSource === "horde") {
+        // Horde: heartbeat is the lightweight health endpoint for the public API.
+        testUrl = buildHordeUrl(baseUrl, "status/heartbeat");
       } else if (conn.provider === "image_generation" && imageSource === "stability") {
         // Stability's generation endpoints live under v2beta, but account/key checks are v1.
         testUrl = buildStabilityUrl(baseUrl, "v1/user/account");
@@ -185,14 +316,28 @@ export async function connectionsRoutes(app: FastifyInstance) {
       } else if (conn.provider === "image_generation" && imageSource === "automatic1111") {
         // AUTOMATIC1111 / SD Web UI: ping the internal ping endpoint
         testUrl = `${baseUrl}/sdapi/v1/options`;
+      } else if (conn.provider === "image_generation" && imageSource === "runpod_comfyui") {
+        // RunPod: use Test Image to verify — no cheap endpoint test available
+        return {
+          success: true,
+          message: "RunPod endpoint configured. Use 'Test Image' to verify generation works.",
+          latencyMs: Date.now() - start,
+          modelName: conn.model,
+        };
+      } else if (conn.provider === "google_vertex") {
+        testUrl = buildGoogleVertexModelUrl(baseUrl, conn.model, "models");
       } else {
         testUrl = `${baseUrl}${provider?.modelsEndpoint || "/models"}`;
       }
 
+      const testHeaders =
+        conn.provider === "image_generation" && imageSource === "horde" ? hordeHeaders(conn.apiKey) : headers;
+      debugLog("[connections/test] provider=%s model=%s catalogUrl=%s", conn.provider, conn.model ?? "", testUrl);
       const res = await safeFetch(testUrl, {
-        headers,
+        headers: testHeaders,
         policy: localUrlPolicyForProvider(conn.provider, imageSource),
         maxResponseBytes: 2 * 1024 * 1024,
+        decodeCompressedResponse: true,
       });
       const latencyMs = Date.now() - start;
 
@@ -200,14 +345,27 @@ export async function connectionsRoutes(app: FastifyInstance) {
         return { success: true, message: "Connection successful", latencyMs, modelName: conn.model };
       } else {
         const body = await res.text();
+        const detail = formatProviderErrorBody(body);
+        debugLog(
+          "[connections/test] provider=%s catalogUrl=%s returned %d: %s",
+          conn.provider,
+          testUrl,
+          res.status,
+          detail,
+        );
         return {
           success: false,
-          message: `API returned ${res.status}: ${body.slice(0, 200)}`,
+          message: `API returned ${res.status}: ${detail}`,
           latencyMs,
           modelName: null,
         };
       }
     } catch (err) {
+      debugLog(
+        "[connections/test] provider=%s failed: %s",
+        conn.provider,
+        err instanceof Error ? err.message : "Unknown error",
+      );
       return {
         success: false,
         message: `Connection failed: ${err instanceof Error ? err.message : "Unknown error"}`,
@@ -231,6 +389,17 @@ export async function connectionsRoutes(app: FastifyInstance) {
         return { models };
       }
 
+      if (conn.provider === "openai_chatgpt") {
+        try {
+          const models = await fetchOpenAIChatGPTModels();
+          if (models.length > 0) return { models };
+        } catch {
+          // Fall through to the curated list so the selector remains usable
+          // before the host has run `codex login`.
+        }
+        return { models: MODEL_LISTS.openai_chatgpt.map((m) => ({ id: m.id, name: m.name })) };
+      }
+
       const { PROVIDERS } = await import("@marinara-engine/shared");
       const provider = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
       let baseUrl = conn.baseUrl || provider?.defaultBaseUrl || "";
@@ -245,6 +414,9 @@ export async function connectionsRoutes(app: FastifyInstance) {
       }
       if (provider?.apiKeyHeader) {
         headers[provider.apiKeyHeader] = conn.apiKey;
+      }
+      if (conn.provider === "google_vertex") {
+        Object.assign(headers, await googleAuthHeadersForVertex(conn.apiKey));
       }
 
       // Anthropic requires version header for models endpoint
@@ -271,6 +443,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
           headers,
           policy: localUrlPolicyForProvider(conn.provider, imageSource),
           maxResponseBytes: 2 * 1024 * 1024,
+          decodeCompressedResponse: true,
         });
         if (!accountRes.ok) {
           const body = await accountRes.text();
@@ -284,6 +457,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
             headers,
             policy: localUrlPolicyForProvider(conn.provider, imageSource),
             maxResponseBytes: 5 * 1024 * 1024,
+            decodeCompressedResponse: true,
           });
           if (!res.ok) {
             const body = await res.text();
@@ -326,6 +500,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
         const res = await safeFetch(`${baseUrl}/object_info/CheckpointLoaderSimple`, {
           policy: localUrlPolicyForProvider(conn.provider, imageSource),
           maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
         });
         if (!res.ok) {
           return reply.status(502).send({ error: `ComfyUI returned ${res.status}` });
@@ -342,6 +517,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
         const res = await safeFetch(`${baseUrl}/sdapi/v1/sd-models`, {
           policy: localUrlPolicyForProvider(conn.provider, imageSource),
           maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
         });
         if (!res.ok) {
           return reply.status(502).send({ error: `SD Web UI returned ${res.status}` });
@@ -360,9 +536,12 @@ export async function connectionsRoutes(app: FastifyInstance) {
           policy: {
             allowLocal: isProviderLocalUrlsEnabled(),
             allowLoopback: true,
+            allowMdns: true,
             allowedProtocols: ["https:", "http:"],
+            flagName: "PROVIDER_LOCAL_URLS_ENABLED",
           },
           maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
         });
         if (!res.ok) {
           const body = await res.text();
@@ -383,7 +562,69 @@ export async function connectionsRoutes(app: FastifyInstance) {
         };
       }
 
-      let modelsUrl = `${baseUrl}${provider?.modelsEndpoint ?? "/models"}`;
+      if (conn.provider === "image_generation" && imageSource === "openrouter") {
+        const modelsUrl = `${baseUrl}/models?output_modalities=image`;
+        const res = await safeFetch(modelsUrl, {
+          headers,
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          return reply.status(502).send({
+            error: `OpenRouter returned ${res.status}: ${sanitizeProviderBody(body)}`,
+          });
+        }
+        const text = await res.text();
+        let json: Record<string, unknown>;
+        try {
+          json = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          return reply.status(502).send({
+            error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+          });
+        }
+        return { models: normalizeModelsResponse("openrouter", json) };
+      }
+
+      if (conn.provider === "image_generation" && imageSource === "horde") {
+        const res = await safeFetch(`${buildHordeUrl(baseUrl, "status/models")}?type=image`, {
+          headers: hordeHeaders(conn.apiKey),
+          policy: localUrlPolicyForProvider(conn.provider, imageSource),
+          maxResponseBytes: 5 * 1024 * 1024,
+          decodeCompressedResponse: true,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          return reply.status(502).send({
+            error: `Horde returned ${res.status}: ${sanitizeProviderBody(body)}`,
+          });
+        }
+        const text = await res.text();
+        let json: unknown;
+        try {
+          json = JSON.parse(text);
+        } catch {
+          return reply.status(502).send({
+            error: `Failed to fetch models: ${sanitizeProviderBody(text)}`,
+          });
+        }
+        const models = (Array.isArray(json) ? json : [])
+          .map((model) => {
+            if (!model || typeof model !== "object") return null;
+            const record = model as { name?: string; id?: string };
+            const id = record.name ?? record.id ?? "";
+            return id ? { id, name: id } : null;
+          })
+          .filter((model): model is { id: string; name: string } => Boolean(model));
+        return { models };
+      }
+
+      let modelsUrl =
+        conn.provider === "google_vertex"
+          ? buildGoogleVertexModelUrl(baseUrl, conn.model, "models")
+          : `${baseUrl}${provider?.modelsEndpoint ?? "/models"}`;
       if (conn.provider === "google") {
         modelsUrl += `?key=${conn.apiKey}`;
       }
@@ -393,9 +634,12 @@ export async function connectionsRoutes(app: FastifyInstance) {
         policy: {
           allowLocal: isProviderLocalUrlsEnabled(),
           allowLoopback: true,
+          allowMdns: true,
           allowedProtocols: ["https:", "http:"],
+          flagName: "PROVIDER_LOCAL_URLS_ENABLED",
         },
         maxResponseBytes: 5 * 1024 * 1024,
+        decodeCompressedResponse: true,
       });
       if (!res.ok) {
         const body = await res.text();
@@ -450,6 +694,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
       const result = await generateImage(imgSource, baseUrl, imgApiKey, imgServiceHint, {
         prompt: BASE_PROMPT,
         model: imgModel || undefined,
+        imageEndpointId: (conn.imageEndpointId as string | undefined) ?? undefined,
         width: 512,
         height: 512,
         comfyWorkflow: conn.comfyuiWorkflow || undefined,
@@ -474,6 +719,97 @@ export async function connectionsRoutes(app: FastifyInstance) {
     }
   });
 
+  // ── Diagnose Claude (Subscription) — verifies which model the SDK actually
+  //    billed against. The Claude Agent SDK can silently route a request to a
+  //    smaller model (fast mode, post-rate-limit `cooldown` state, account-tier
+  //    gating) without surfacing the swap to the caller. We send a tiny prompt
+  //    through the SDK with fast mode forced off, then return the model(s) the
+  //    SDK reports in `modelUsage` plus its `fast_mode_state` so the UI can
+  //    show "you asked for X, the SDK billed Y." ──
+  app.post<{ Params: { id: string } }>("/:id/diagnose-claude-subscription", async (req, reply) => {
+    const conn = await storage.getWithKey(req.params.id);
+    if (!conn) return reply.status(404).send({ error: "Connection not found" });
+    if (conn.provider !== "claude_subscription") {
+      return reply.status(400).send({ error: "Not a Claude (Subscription) connection" });
+    }
+    if (!conn.model) {
+      return reply.status(400).send({ error: "No model configured. Pick a model first." });
+    }
+
+    const start = Date.now();
+    const requestedModel = conn.model;
+    let responseText = "";
+    let modelsBilled: string[] = [];
+    let modelUsageDetail: Array<{ model: string; inputTokens: number; outputTokens: number }> = [];
+    let fastModeState: string | null = null;
+    const errors: string[] = [];
+
+    try {
+      const sdk = await import("@anthropic-ai/claude-agent-sdk");
+      // The user's empirically reliable self-ID prompt. Asking the model "which
+      // Claude family are you (Opus/Sonnet/Haiku)" with a one-word constraint
+      // produces consistent, non-hallucinated answers — versions are unreliable
+      // but the family tier is not. Combined with the SDK-side `modelUsage`
+      // readout below, this gives two independent signals on the same call.
+      const fastMode = conn.claudeFastMode === "true";
+      // Use the Claude Code preset for `systemPrompt`. Without it the SDK
+      // strips the model's version awareness and every model falsely answers
+      // "Sonnet" — see the chat provider for the full explanation. Passing the
+      // preset gives a clean signal on the model's true identity.
+      const queryHandle = sdk.query({
+        prompt:
+          "[OOC, hold on for one second, and tell me which claude model you are, you don't need to give me the version, are you Opus, Sonnet, Or Haiku? Answer with only the 1 word model name.]",
+        options: {
+          model: requestedModel,
+          systemPrompt: { type: "preset", preset: "claude_code" },
+          tools: [],
+          permissionMode: "bypassPermissions",
+          includePartialMessages: false,
+          settings: { fastMode },
+          ...(conn.apiKey ? { env: { ...process.env, ANTHROPIC_API_KEY: conn.apiKey } } : {}),
+        },
+      });
+
+      for await (const message of queryHandle) {
+        if (message.type === "assistant") {
+          const blocks = (message.message?.content ?? []) as Array<{ type: string; text?: string }>;
+          for (const block of blocks) {
+            if (block.type === "text" && block.text) responseText += block.text;
+          }
+        } else if (message.type === "result") {
+          const usage = message.modelUsage ?? {};
+          modelsBilled = Object.keys(usage);
+          modelUsageDetail = Object.entries(usage).map(([model, u]) => ({
+            model,
+            inputTokens: (u as { inputTokens?: number }).inputTokens ?? 0,
+            outputTokens: (u as { outputTokens?: number }).outputTokens ?? 0,
+          }));
+          fastModeState = message.fast_mode_state ?? null;
+          if (message.subtype !== "success") {
+            const detail = message.errors?.length ? message.errors.join("; ") : message.subtype;
+            errors.push(detail);
+          }
+        }
+      }
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : "Unknown error");
+    }
+
+    const latencyMs = Date.now() - start;
+    const billedDifferent = modelsBilled.length > 0 && !modelsBilled.includes(requestedModel);
+    return {
+      success: errors.length === 0,
+      requestedModel,
+      modelsBilled,
+      modelUsageDetail,
+      billedDifferent,
+      fastModeState,
+      response: responseText.slice(0, 500),
+      errors,
+      latencyMs,
+    };
+  });
+
   // ── Test message — sends "hi" to the model and returns the response ──
   app.post<{ Params: { id: string } }>("/:id/test-message", async (req, reply) => {
     const conn = await storage.getWithKey(req.params.id);
@@ -487,14 +823,18 @@ export async function connectionsRoutes(app: FastifyInstance) {
     const providerDef = PROVIDERS[conn.provider as keyof typeof PROVIDERS];
     const baseUrl = (conn.baseUrl || providerDef?.defaultBaseUrl || "").replace(/\/+$/, "");
 
-    // Claude (Subscription) is HTTP-less — the SDK manages the endpoint, so
-    // skip the baseUrl precondition. Every other provider still requires one.
-    if (!baseUrl && conn.provider !== "claude_subscription") {
+    // Local subscription/session providers manage their own endpoint, so skip
+    // the baseUrl precondition. Every HTTP provider still requires one.
+    if (!baseUrl && conn.provider !== "claude_subscription" && conn.provider !== "openai_chatgpt") {
       return reply.status(400).send({ error: "No base URL configured" });
     }
 
     const start = Date.now();
+    const requestDebug = readDebugMode(req.body);
+    const debugLog = (message: string, ...args: any[]) => logDebugOverride(requestDebug, message, ...args);
+    const targetUrl = describeTestMessageTarget(conn.provider, baseUrl, conn.model);
     try {
+      debugLog("[connections/test-message] provider=%s model=%s url=%s", conn.provider, conn.model, targetUrl);
       const provider = createLLMProvider(
         conn.provider,
         baseUrl,
@@ -502,6 +842,7 @@ export async function connectionsRoutes(app: FastifyInstance) {
         conn.maxContext,
         conn.openrouterProvider,
         conn.maxTokensOverride,
+        conn.claudeFastMode === "true",
       );
 
       let fullResponse = "";
@@ -515,6 +856,12 @@ export async function connectionsRoutes(app: FastifyInstance) {
       }
 
       const latencyMs = Date.now() - start;
+      debugLog(
+        "[connections/test-message] url=%s success in %dms: %s",
+        targetUrl,
+        latencyMs,
+        fullResponse.slice(0, 500),
+      );
       return {
         success: true,
         response: fullResponse.slice(0, 500),
@@ -522,6 +869,13 @@ export async function connectionsRoutes(app: FastifyInstance) {
         model: conn.model,
       };
     } catch (err) {
+      debugLog(
+        "[connections/test-message] provider=%s model=%s url=%s failed: %s",
+        conn.provider,
+        conn.model,
+        targetUrl,
+        err instanceof Error ? err.message : "Unknown error",
+      );
       return {
         success: false,
         response: "",
@@ -555,6 +909,22 @@ function normalizeModelsResponse(provider: string, json: Record<string, unknown>
         .map((m) => ({
           id: (m.name ?? "").replace(/^models\//, ""),
           name: m.displayName ?? (m.name ?? "").replace(/^models\//, ""),
+        }))
+        .filter((m) => m.id);
+    }
+
+    case "google_vertex": {
+      // Vertex AI returns { publisherModels: [{ name: "publishers/google/models/gemini-...", ... }] }
+      const models = (json.publisherModels ?? []) as Array<{
+        name?: string;
+        displayName?: string;
+        supportedActions?: { viewRestApi?: unknown };
+      }>;
+      return models
+        .filter((m) => m.name?.includes("/models/"))
+        .map((m) => ({
+          id: (m.name ?? "").replace(/^.*\/models\//, ""),
+          name: m.displayName ?? (m.name ?? "").replace(/^.*\/models\//, ""),
         }))
         .filter((m) => m.id);
     }

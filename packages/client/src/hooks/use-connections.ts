@@ -3,6 +3,7 @@
 // ──────────────────────────────────────────────
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api-client";
+import { useUIStore } from "../stores/ui.store";
 import type { ConnectionTestResult } from "@marinara-engine/shared";
 
 export const connectionKeys = {
@@ -72,14 +73,36 @@ export function useDeleteConnection() {
 
 export function useTestConnection() {
   return useMutation({
-    mutationFn: (id: string) => api.post<ConnectionTestResult>(`/connections/${id}/test`),
+    mutationFn: (id: string) =>
+      api.post<ConnectionTestResult>(`/connections/${id}/test`, { debugMode: useUIStore.getState().debugMode }),
   });
 }
 
 export function useTestMessage() {
   return useMutation({
     mutationFn: (id: string) =>
-      api.post<{ success: boolean; response: string; latencyMs: number }>(`/connections/${id}/test-message`),
+      api.post<{ success: boolean; response: string; latencyMs: number }>(`/connections/${id}/test-message`, {
+        debugMode: useUIStore.getState().debugMode,
+      }),
+  });
+}
+
+export interface ClaudeSubscriptionDiagnosis {
+  success: boolean;
+  requestedModel: string;
+  modelsBilled: string[];
+  modelUsageDetail: Array<{ model: string; inputTokens: number; outputTokens: number }>;
+  billedDifferent: boolean;
+  fastModeState: "off" | "cooldown" | "on" | null;
+  response: string;
+  errors: string[];
+  latencyMs: number;
+}
+
+export function useDiagnoseClaudeSubscription() {
+  return useMutation({
+    mutationFn: (id: string) =>
+      api.post<ClaudeSubscriptionDiagnosis>(`/connections/${id}/diagnose-claude-subscription`),
   });
 }
 

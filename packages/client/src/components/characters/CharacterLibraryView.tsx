@@ -1,8 +1,20 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { ArrowLeft, ArrowUpDown, Download, Pencil, Plus, Search, Sparkles, Star, User } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowUpDown,
+  Download,
+  MessageCircle,
+  Pencil,
+  Plus,
+  Search,
+  Sparkles,
+  Star,
+  User,
+} from "lucide-react";
 import { useCharacters } from "../../hooks/use-characters";
+import { useStartChatFromCharacter } from "../../hooks/use-start-chat-from-character";
 import { getCharacterTitle } from "../../lib/character-display";
-import { cn, getAvatarCropStyle } from "../../lib/utils";
+import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
 import { useUIStore } from "../../stores/ui.store";
 import type { CharacterData } from "@marinara-engine/shared";
 
@@ -34,6 +46,29 @@ function parseCharacterRow(char: CharacterRow): ParsedCharacterRow {
 
 function getText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function getCharacterTags(char: ParsedCharacterRow): string[] {
+  return (Array.isArray(char.parsed.tags) ? char.parsed.tags : []).filter(
+    (tag): tag is string => typeof tag === "string" && tag.trim().length > 0,
+  );
+}
+
+function parseCharacterSearchQuery(value: string) {
+  const excludedTags: string[] = [];
+  const text = value
+    .replace(/(?:^|\s)(?:-|!)(?:tag:|#)?(?:"([^"]+)"|(\S+))/gi, (_match, quoted: string, bare: string) => {
+      const tag = (quoted ?? bare ?? "").trim();
+      if (tag) excludedTags.push(tag.toLowerCase());
+      return " ";
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    text: text.toLowerCase(),
+    excludedTags,
+  };
 }
 
 function getCharacterSummary(char: ParsedCharacterRow) {
@@ -81,6 +116,7 @@ function CharacterLibraryDetailCard({
   character: ParsedCharacterRow;
   onEdit: (id: string) => void;
 }) {
+  const { startChatFromCharacter, isStartingChat } = useStartChatFromCharacter();
   const characterName = getText(character.parsed.name) || "Unnamed";
   const characterTitle = getCharacterTitle({ name: characterName, comment: character.comment });
   const characterMeta = getCharacterMeta(character);
@@ -90,17 +126,13 @@ function CharacterLibraryDetailCard({
   return (
     <div className="space-y-4">
       <div className="overflow-hidden rounded-[1.5rem] border border-[var(--border)]/50 bg-[var(--background)]/70 shadow-[0_24px_70px_-40px_rgba(15,23,42,0.95)] sm:rounded-[2rem]">
-        <div className="relative aspect-[4/3] overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15">
+        <div className="relative aspect-square overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15">
           {character.avatarPath ? (
             <img
               src={character.avatarPath}
               alt={characterName || "Selected character"}
               className="h-full w-full object-cover"
-              style={getAvatarCropStyle(
-                character.parsed.extensions?.avatarCrop as
-                  | { zoom: number; offsetX: number; offsetY: number }
-                  | undefined,
-              )}
+              style={getAvatarCropStyle(character.parsed.extensions?.avatarCrop as AvatarCropValue | undefined)}
             />
           ) : (
             <div className="flex h-full w-full items-center justify-center text-white/85">
@@ -137,6 +169,25 @@ function CharacterLibraryDetailCard({
             )}
 
             <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  startChatFromCharacter({
+                    characterId: character.id,
+                    characterName,
+                    mode: "roleplay",
+                    firstMessage: getText(character.parsed.first_mes),
+                    alternateGreetings: Array.isArray(character.parsed.alternate_greetings)
+                      ? character.parsed.alternate_greetings
+                      : [],
+                  })
+                }
+                disabled={isStartingChat}
+                className="inline-flex items-center gap-2 rounded-2xl bg-[var(--primary)] px-4 py-2.5 text-sm font-medium text-[var(--primary-foreground)] shadow-lg shadow-pink-500/15 transition-all hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <MessageCircle size="0.875rem" />
+                Start New Chat
+              </button>
               <button
                 onClick={() => onEdit(character.id)}
                 className="inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-pink-400 to-rose-500 px-4 py-2.5 text-sm font-medium text-white shadow-lg shadow-pink-500/15 transition-all hover:shadow-pink-500/25"
@@ -187,12 +238,15 @@ export function CharacterLibraryView() {
   }, [characters]);
 
   const filteredCharacters = useMemo(() => {
-    const query = search.trim().toLowerCase();
+    const query = parseCharacterSearchQuery(search);
 
     return parsedCharacters.filter((char) => {
       const isFavorite = !!char.parsed.extensions?.fav;
       if (favoritesOnly && !isFavorite) return false;
-      if (!query) return true;
+      const tags = getCharacterTags(char);
+      const tagSet = new Set(tags.map((tag) => tag.toLowerCase()));
+      if (query.excludedTags.some((tag) => tagSet.has(tag))) return false;
+      if (!query.text) return true;
 
       const fields = [
         getText(char.parsed.name),
@@ -201,10 +255,10 @@ export function CharacterLibraryView() {
         getText(char.parsed.description),
         getText(char.parsed.creator_notes),
         getText(char.parsed.personality),
-        ...((Array.isArray(char.parsed.tags) ? char.parsed.tags : []) as string[]),
+        ...tags,
       ];
 
-      return fields.some((value) => value.toLowerCase().includes(query));
+      return fields.some((value) => value.toLowerCase().includes(query.text));
     });
   }, [favoritesOnly, parsedCharacters, search]);
 
@@ -307,7 +361,7 @@ export function CharacterLibraryView() {
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search names, tags, creator notes, or descriptions"
+              placeholder='Search names, tags, descriptions, or -tag:"tag name"'
               className="w-full rounded-2xl border border-[var(--border)]/60 bg-[var(--secondary)]/80 py-2 pl-8.5 pr-3 text-[0.8125rem] outline-none transition-colors placeholder:text-[var(--muted-foreground)]/70 focus:border-[var(--primary)]/40 focus:ring-1 focus:ring-[var(--primary)]/20 md:py-2.5 md:pl-9 md:text-sm"
             />
           </div>
@@ -352,7 +406,7 @@ export function CharacterLibraryView() {
           {isLoading && (
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
               {[1, 2, 3, 4, 5, 6].map((item) => (
-                <div key={item} className="shimmer aspect-[4/5] rounded-[1.75rem]" />
+                <div key={item} className="shimmer aspect-square rounded-[1.75rem]" />
               ))}
             </div>
           )}
@@ -379,7 +433,7 @@ export function CharacterLibraryView() {
                 const cardSummary = truncateText(getCharacterSummary(char), 180);
                 const cardMeta = getCharacterMeta(char);
                 const isFavorite = !!char.parsed.extensions?.fav;
-                const tags = ((Array.isArray(char.parsed.tags) ? char.parsed.tags : []) as string[]).filter(Boolean);
+                const tags = getCharacterTags(char);
                 const isActive = selectedCharacterId === char.id;
 
                 return (
@@ -394,7 +448,7 @@ export function CharacterLibraryView() {
                           : "border-[var(--border)]/50",
                       )}
                     >
-                      <div className="relative h-24 w-24 shrink-0 overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15 sm:h-auto sm:w-full sm:aspect-[4/3]">
+                      <div className="relative h-24 w-24 shrink-0 overflow-hidden bg-gradient-to-br from-pink-400/25 via-rose-500/15 to-sky-400/15 sm:h-auto sm:w-full sm:aspect-square">
                         {char.avatarPath ? (
                           <img
                             src={char.avatarPath}
@@ -402,9 +456,7 @@ export function CharacterLibraryView() {
                             loading="lazy"
                             className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
                             style={getAvatarCropStyle(
-                              char.parsed.extensions?.avatarCrop as
-                                | { zoom: number; offsetX: number; offsetY: number }
-                                | undefined,
+                              char.parsed.extensions?.avatarCrop as AvatarCropValue | undefined,
                             )}
                           />
                         ) : (

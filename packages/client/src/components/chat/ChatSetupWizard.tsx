@@ -30,6 +30,7 @@ import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets
 import { useUIStore } from "../../stores/ui.store";
 import { useChatStore } from "../../stores/chat.store";
 import { api } from "../../lib/api-client";
+import { filterLanguageGenerationConnections } from "../../lib/connection-filters";
 import { getCharacterTitle, parseCharacterDisplayData } from "../../lib/character-display";
 import { ChoiceSelectionModal } from "../presets/ChoiceSelectionModal";
 import type { Chat, ChatMode, ChatPreset } from "@marinara-engine/shared";
@@ -110,6 +111,7 @@ type PersonaSetupOption = PersonaDisplayInfo & {
 type ConnectionSetupOption = {
   id: string;
   name: string;
+  provider?: string;
   defaultParameters?: unknown;
 };
 
@@ -144,7 +146,7 @@ function CharacterAvatarImage({
   className: string;
 }) {
   return (
-    <span className={cn("block shrink-0 overflow-hidden", className)}>
+    <span className={cn("relative block shrink-0 overflow-hidden", className)}>
       <img
         src={src}
         alt={alt}
@@ -336,7 +338,10 @@ function ConversationQuickSetup({ chat, onFinish }: ChatSetupWizardProps) {
     const raw = (chat as unknown as { metadata?: string | Record<string, unknown> }).metadata;
     return typeof raw === "string" ? JSON.parse(raw) : (raw ?? {});
   }, [chat]);
-  const connectionOptions = useMemo(() => ((connections ?? []) as ConnectionSetupOption[]) ?? [], [connections]);
+  const connectionOptions = useMemo(
+    () => filterLanguageGenerationConnections((connections ?? []) as ConnectionSetupOption[]),
+    [connections],
+  );
   const selectedConnection = useMemo(
     () => connectionOptions.find((connection) => connection.id === chat.connectionId) ?? null,
     [connectionOptions, chat.connectionId],
@@ -864,7 +869,10 @@ function RoleplaySetupWizard({ chat, onFinish }: ChatSetupWizardProps) {
       (allCharacters ?? []) as Array<{ id: string; data: string; comment?: string | null; avatarPath: string | null }>,
     [allCharacters],
   );
-  const connectionOptions = useMemo(() => ((connections ?? []) as ConnectionSetupOption[]) ?? [], [connections]);
+  const connectionOptions = useMemo(
+    () => filterLanguageGenerationConnections((connections ?? []) as ConnectionSetupOption[]),
+    [connections],
+  );
   const selectedConnection = useMemo(
     () => connectionOptions.find((connection) => connection.id === chat.connectionId) ?? null,
     [connectionOptions, chat.connectionId],

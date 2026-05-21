@@ -9,6 +9,8 @@ export interface MacroCharacterData {
   appearance?: string;
   scenario?: string;
   example?: string;
+  systemPrompt?: string;
+  postHistoryInstructions?: string;
 }
 
 export interface MacroPersonaData {
@@ -30,10 +32,15 @@ function getRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function appendActiveAltDescriptions(description: string, altDescriptions: unknown): string {
-  if (typeof altDescriptions !== "string" || !altDescriptions.trim()) return description;
-
   try {
-    const parsed = JSON.parse(altDescriptions) as Array<{ active?: boolean; content?: string }>;
+    const parsed =
+      typeof altDescriptions === "string"
+        ? altDescriptions.trim()
+          ? (JSON.parse(altDescriptions) as Array<{ active?: boolean; content?: string }>)
+          : []
+        : Array.isArray(altDescriptions)
+          ? (altDescriptions as Array<{ active?: boolean; content?: string }>)
+          : [];
     const activeDescriptions = parsed
       .filter((item) => item?.active && typeof item.content === "string" && item.content.trim().length > 0)
       .map((item) => item.content!.trim());
@@ -79,12 +86,17 @@ export function parseCharacterMacroData(
     return {
       id: raw.id,
       name: getString(data.name) || "Unknown",
-      description: getString(data.description),
+      description: appendActiveAltDescriptions(
+        getString(data.description),
+        extensions?.altDescriptions ?? extensions?.descriptionExtensions,
+      ),
       personality: getString(data.personality),
       backstory: getString(extensions?.backstory),
       appearance: getString(extensions?.appearance),
       scenario: getString(data.scenario),
       example: getString(data.mes_example),
+      systemPrompt: getString(data.system_prompt),
+      postHistoryInstructions: getString(data.post_history_instructions),
     };
   } catch {
     return { id: raw.id, name: "Unknown" };
@@ -184,6 +196,8 @@ export function buildMessageMacroContext({
           appearance: fallbackCharacter.appearance ?? "",
           scenario: fallbackCharacter.scenario ?? "",
           example: fallbackCharacter.example ?? "",
+          systemPrompt: fallbackCharacter.systemPrompt ?? "",
+          postHistoryInstructions: fallbackCharacter.postHistoryInstructions ?? "",
         }
       : undefined,
     personaFields: persona
@@ -202,7 +216,12 @@ export function resolveMessageMacros(
   template: string,
   context: Parameters<typeof buildMessageMacroContext>[0],
 ): string {
-  return resolveMacros(template, buildMessageMacroContext(context), { trimResult: false });
+  return createMessageMacroResolver(context)(template);
+}
+
+export function createMessageMacroResolver(context: Parameters<typeof buildMessageMacroContext>[0]) {
+  const macroContext = buildMessageMacroContext(context);
+  return (template: string) => resolveMacros(template, macroContext, { trimResult: false });
 }
 
 export function isPromptPreviewMacro(input: string): boolean {
@@ -214,12 +233,23 @@ export function resolveInputMacrosForChat(
   chat: { characterIds?: unknown; personaId?: string | null; mode?: string | null } | null | undefined,
   characters: Array<{ id: string; data: unknown }> | undefined,
   personas: Array<Record<string, unknown>> | undefined,
+  lastInput?: string,
 ): string {
+  return createInputMacroResolverForChat(chat, characters, personas, lastInput)(template);
+}
+
+export function createInputMacroResolverForChat(
+  chat: { characterIds?: unknown; personaId?: string | null; mode?: string | null } | null | undefined,
+  characters: Array<{ id: string; data: unknown }> | undefined,
+  personas: Array<Record<string, unknown>> | undefined,
+  lastInput?: string,
+) {
   const chatCharacters = selectChatCharacters(chat, characters);
   const activePersona = selectActivePersona(chat, personas);
-  return resolveMessageMacros(template, {
+  return createMessageMacroResolver({
     persona: activePersona,
     primaryCharacter: chatCharacters[0] ?? null,
     characters: chatCharacters,
+    lastInput,
   });
 }

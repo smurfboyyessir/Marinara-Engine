@@ -35,6 +35,12 @@ export interface SkillCheckTag {
   advantage?: boolean;
   disadvantage?: boolean;
   resolvedResult?: SkillCheckResult;
+  /**
+   * Player-submitted d20 echoed by the GM when a `[dice:1d20]` was rolled
+   * before the check. Forwarded to the server resolver so the sheet's
+   * attribute modifier is applied on top of the player's number.
+   */
+  preRolledD20?: number;
 }
 
 export interface ElementAttackTag {
@@ -47,6 +53,7 @@ export interface ElementAttackTag {
 export interface InventoryTag {
   action: "add" | "remove";
   items: string[];
+  count?: number;
 }
 
 export interface SegmentInventoryUpdate {
@@ -318,6 +325,15 @@ function parseSkillCheckTagBody(body: string): SkillCheckTag | null {
   const modeValue = values.get("mode")?.trim().toLowerCase();
 
   if (!rollsValue || Number.isNaN(modifier) || Number.isNaN(total) || !resultValue) {
+    // Sparse tag — server resolver will roll + apply modifier. If the GM echoed
+    // a single integer in rolls="...", treat it as a player-submitted d20.
+    if (rollsValue) {
+      const trimmed = rollsValue.trim();
+      if (/^-?\d+$/.test(trimmed)) {
+        const n = Number.parseInt(trimmed, 10);
+        if (Number.isInteger(n) && n >= 1 && n <= 20) tag.preRolledD20 = n;
+      }
+    }
     return tag;
   }
 
@@ -531,7 +547,11 @@ function parseInventoryTagBody(body: string): InventoryTag | null {
     .map((item) => item.trim().replace(/^["']|["']$/g, ""))
     .filter(Boolean);
 
-  return items.length > 0 ? { action, items } : null;
+  const countMatch = /(?:count|quantity|qty)\s*=\s*"?(\d+)"?/i.exec(body);
+  const parsedCount = countMatch ? parseInt(countMatch[1]!, 10) : 1;
+  const count = Number.isFinite(parsedCount) && parsedCount > 0 ? Math.min(parsedCount, 9999) : 1;
+
+  return items.length > 0 ? { action, items, count } : null;
 }
 
 function parsePartyCharacterName(body: string): string {

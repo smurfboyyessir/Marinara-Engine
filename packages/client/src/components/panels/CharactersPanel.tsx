@@ -13,8 +13,8 @@ import {
   useUpdateCharacter,
   useDuplicateCharacter,
 } from "../../hooks/use-characters";
-import { useUpdateChat, useCreateMessage, useCreateChat, chatKeys } from "../../hooks/use-chats";
-import { useChatPresets, useApplyChatPreset } from "../../hooks/use-chat-presets";
+import { useUpdateChat, useCreateMessage, chatKeys } from "../../hooks/use-chats";
+import { useStartChatFromCharacter } from "../../hooks/use-start-chat-from-character";
 import { api } from "../../lib/api-client";
 import { showConfirmDialog } from "../../lib/app-dialogs";
 import { useChatStore } from "../../stores/chat.store";
@@ -43,10 +43,11 @@ import {
   MessageCircle,
   Star,
   Wand2,
+  Minus,
 } from "lucide-react";
 import { getCharacterTitle } from "../../lib/character-display";
 import { useUIStore } from "../../stores/ui.store";
-import { cn, getAvatarCropStyle } from "../../lib/utils";
+import { cn, getAvatarCropStyle, type AvatarCropValue } from "../../lib/utils";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
 
 type CharacterRow = {
@@ -62,6 +63,27 @@ type ParsedCharacterRow = CharacterRow & { parsed: Record<string, any> };
 
 type SortOption = "name-asc" | "name-desc" | "newest" | "oldest" | "favorites";
 
+function getCharacterTags(char: ParsedCharacterRow): string[] {
+  return Array.isArray(char.parsed.tags) ? (char.parsed.tags as string[]).filter(Boolean) : [];
+}
+
+function parseCharacterSearchQuery(value: string) {
+  const excludedTags: string[] = [];
+  const text = value
+    .replace(/(?:^|\s)(?:-|!)(?:tag:|#)?(?:"([^"]+)"|(\S+))/gi, (_match, quoted: string, bare: string) => {
+      const tag = (quoted ?? bare ?? "").trim();
+      if (tag) excludedTags.push(tag.toLowerCase());
+      return " ";
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    text: text.toLowerCase(),
+    excludedTags,
+  };
+}
+
 function getCharacterPreviewMetadata(char: ParsedCharacterRow): string | null {
   const parts: string[] = [];
   const creator = typeof char.parsed.creator === "string" ? char.parsed.creator.trim() : "";
@@ -76,7 +98,7 @@ function getCharacterPreviewMetadata(char: ParsedCharacterRow): string | null {
       : {};
   const spec = typeof cardMetadata.spec === "string" ? cardMetadata.spec.trim() : "";
   const specVersion = typeof cardMetadata.specVersion === "string" ? cardMetadata.specVersion.trim() : "";
-  const tags = Array.isArray(char.parsed.tags) ? (char.parsed.tags as string[]).filter(Boolean) : [];
+  const tags = getCharacterTags(char);
 
   if (creator) parts.push(`by ${creator}`);
   if (version) parts.push(`v${version}`);
@@ -102,10 +124,8 @@ export function CharactersPanel() {
   const activeChat = useChatStore((s) => s.activeChat);
   const updateChat = useUpdateChat();
   const createMessage = useCreateMessage(activeChat?.id ?? null);
-  const createChat = useCreateChat();
   const queryClient = useQueryClient();
-  const { data: chatPresetsData } = useChatPresets();
-  const applyChatPreset = useApplyChatPreset();
+  const { startChatFromCharacter, isStartingChat } = useStartChatFromCharacter();
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -114,67 +134,6 @@ export function CharactersPanel() {
     firstMes?: string;
     altGreetings?: string[];
   } | null>(null);
-
-  const quickStartFromCharacter = useCallback(
-    (
-      charId: string,
-      charName: string,
-      mode: "roleplay" | "conversation",
-      firstMes?: string,
-      altGreetings?: string[],
-    ) => {
-      const label = mode === "conversation" ? "Conversation" : "Roleplay";
-      // Resolve the user's starred default preset for this mode (skip the built-in Default — it's a no-op).
-      const presets = chatPresetsData ?? [];
-      const presetMode = mode === "conversation" ? "conversation" : "roleplay";
-      const starred = presets.find((p) => p.mode === presetMode && p.isActive && !p.isDefault);
-      createChat.mutate(
-        { name: charName ? `${charName} — ${label}` : `New ${label}`, mode, characterIds: [charId] },
-        {
-          onSuccess: async (chat) => {
-            useChatStore.getState().setActiveChatId(chat.id);
-            // Apply the user's starred default preset to the new chat so its
-            // settings start where they want them.
-            if (starred) {
-              try {
-                await applyChatPreset.mutateAsync({ presetId: starred.id, chatId: chat.id });
-              } catch {
-                /* non-fatal — chat still opens with system defaults */
-              }
-            }
-            // Mirror the wizard's roleplay first-message behavior — without this,
-            // a quick-started roleplay would open with no greeting from the character.
-            if (mode === "roleplay" && firstMes?.trim()) {
-              try {
-                const msg = await api.post<{ id: string }>(`/chats/${chat.id}/messages`, {
-                  role: "assistant",
-                  content: firstMes,
-                  characterId: charId,
-                });
-                if (msg?.id && altGreetings?.length) {
-                  for (const greeting of altGreetings) {
-                    if (greeting.trim()) {
-                      await api.post(`/chats/${chat.id}/messages/${msg.id}/swipes`, {
-                        content: greeting,
-                        silent: true,
-                      });
-                    }
-                  }
-                }
-                queryClient.invalidateQueries({ queryKey: chatKeys.messages(chat.id) });
-              } catch {
-                /* swallow — don't block the chat from opening if greeting injection fails */
-              }
-            }
-            useChatStore.getState().setShouldOpenSettings(true);
-            useChatStore.getState().setShouldOpenWizard(true);
-            useChatStore.getState().setShouldOpenWizardInShortcutMode(true);
-          },
-        },
-      );
-    },
-    [createChat, queryClient, chatPresetsData, applyChatPreset],
-  );
 
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<SortOption>("name-asc");
@@ -193,6 +152,7 @@ export function CharactersPanel() {
     alternateGreetings: string[];
   } | null>(null);
   const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [excludedTags, setExcludedTags] = useState<Set<string>>(new Set());
   const [tagsExpanded, setTagsExpanded] = useState(false);
   const [favFilter, setFavFilter] = useState<"all" | "favorites" | "non-favorites">("all");
   const [selectionMode, setSelectionMode] = useState(false);
@@ -229,6 +189,7 @@ export function CharactersPanel() {
 
   const filteredCharacters = useMemo(() => {
     let list = parsedCharacters;
+    const query = parseCharacterSearchQuery(search);
     // Filter by favorites
     if (favFilter === "favorites") {
       list = list.filter((c) => c.parsed.extensions?.fav);
@@ -237,27 +198,39 @@ export function CharactersPanel() {
     }
     // Filter by active tag
     if (activeTag) {
-      list = list.filter((c) => (c.parsed.tags ?? []).some((t: string) => t === activeTag));
+      list = list.filter((c) => getCharacterTags(c).some((t) => t === activeTag));
+    }
+    const excludedTagFilters = new Set([
+      ...Array.from(excludedTags, (tag) => tag.toLowerCase()),
+      ...query.excludedTags,
+    ]);
+    if (excludedTagFilters.size > 0) {
+      list = list.filter((c) => {
+        const tags = new Set(getCharacterTags(c).map((tag) => tag.toLowerCase()));
+        for (const tag of excludedTagFilters) {
+          if (tags.has(tag)) return false;
+        }
+        return true;
+      });
     }
     // Filter by search text
-    if (search.trim()) {
-      const q = search.toLowerCase();
+    if (query.text) {
       list = list.filter(
         (c) =>
-          (c.parsed.name ?? "").toLowerCase().includes(q) ||
-          (typeof c.comment === "string" && c.comment.toLowerCase().includes(q)) ||
-          (c.parsed.description ?? "").toLowerCase().includes(q) ||
-          (c.parsed.tags ?? []).some((t: string) => t.toLowerCase().includes(q)),
+          (c.parsed.name ?? "").toLowerCase().includes(query.text) ||
+          (typeof c.comment === "string" && c.comment.toLowerCase().includes(query.text)) ||
+          (c.parsed.description ?? "").toLowerCase().includes(query.text) ||
+          getCharacterTags(c).some((t) => t.toLowerCase().includes(query.text)),
       );
     }
     return list;
-  }, [parsedCharacters, search, activeTag, favFilter]);
+  }, [parsedCharacters, search, activeTag, excludedTags, favFilter]);
 
   // Collect all unique tags across characters for the filter bar
   const allTags = useMemo(() => {
     const tagSet = new Set<string>();
     for (const c of parsedCharacters) {
-      for (const t of (c.parsed.tags ?? []) as string[]) {
+      for (const t of getCharacterTags(c)) {
         tagSet.add(t);
       }
     }
@@ -277,18 +250,52 @@ export function CharactersPanel() {
         return;
       }
       try {
-        const affected = parsedCharacters.filter((c) => ((c.parsed.tags ?? []) as string[]).includes(tag));
+        const affected = parsedCharacters.filter((c) => getCharacterTags(c).includes(tag));
         for (const c of affected) {
-          const newTags = ((c.parsed.tags ?? []) as string[]).filter((t) => t !== tag);
+          const newTags = getCharacterTags(c).filter((t) => t !== tag);
           await updateCharacter.mutateAsync({ id: c.id, data: { tags: newTags } });
         }
         if (activeTag === tag) setActiveTag(null);
+        setExcludedTags((prev) => {
+          if (!prev.has(tag)) return prev;
+          const next = new Set(prev);
+          next.delete(tag);
+          return next;
+        });
       } catch {
         toast.error("Failed to remove tag from some characters");
       }
     },
     [parsedCharacters, updateCharacter, activeTag],
   );
+
+  const toggleIncludedTag = useCallback((tag: string) => {
+    setActiveTag((current) => (current === tag ? null : tag));
+    setExcludedTags((prev) => {
+      if (!prev.has(tag)) return prev;
+      const next = new Set(prev);
+      next.delete(tag);
+      return next;
+    });
+  }, []);
+
+  const toggleExcludedTag = useCallback((tag: string) => {
+    setActiveTag((current) => (current === tag ? null : current));
+    setExcludedTags((prev) => {
+      const next = new Set(prev);
+      if (next.has(tag)) {
+        next.delete(tag);
+      } else {
+        next.add(tag);
+      }
+      return next;
+    });
+  }, []);
+
+  const clearTagFilters = useCallback(() => {
+    setActiveTag(null);
+    setExcludedTags(new Set());
+  }, []);
 
   const sortedCharacters = useMemo(() => {
     const list = [...filteredCharacters];
@@ -491,6 +498,19 @@ export function CharactersPanel() {
     exitSelectionMode();
   }, [selectedCharacterIds, deleteCharacter, exitSelectionMode]);
 
+  const handleStartNewChat = useCallback(
+    (characterId: string, characterName: string, firstMessage?: string, alternateGreetings?: string[]) => {
+      startChatFromCharacter({
+        characterId,
+        characterName,
+        mode: "roleplay",
+        firstMessage,
+        alternateGreetings,
+      });
+    },
+    [startChatFromCharacter],
+  );
+
   return (
     <div className="flex flex-col gap-2 p-3">
       <button
@@ -512,7 +532,7 @@ export function CharactersPanel() {
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search characters"
+            placeholder='Search characters or -tag:"tag name"'
             className="w-full rounded-xl border border-[var(--border)] bg-[var(--secondary)] py-2 pl-8 pr-3 text-xs outline-none transition-colors placeholder:text-[var(--muted-foreground)]/50 focus:border-[var(--primary)]/40 focus:ring-1 focus:ring-[var(--primary)]/20"
           />
         </div>
@@ -562,59 +582,86 @@ export function CharactersPanel() {
             onClick={() => setTagsExpanded(!tagsExpanded)}
             className={cn(
               "flex items-center gap-1.5 rounded-lg px-2 py-1 text-[0.625rem] font-medium transition-all",
-              activeTag
+              activeTag || excludedTags.size > 0
                 ? "bg-[var(--primary)]/15 text-[var(--primary)]"
                 : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
             )}
           >
             <Tag size="0.625rem" />
-            Tags ({allTags.length}){activeTag && <span className="ml-0.5 opacity-70">· {activeTag}</span>}
+            Tags ({allTags.length})
+            {(activeTag || excludedTags.size > 0) && (
+              <span className="ml-0.5 opacity-70">
+                · {[activeTag, excludedTags.size > 0 ? `-${excludedTags.size}` : null].filter(Boolean).join(" · ")}
+              </span>
+            )}
             <ChevronDown size="0.625rem" className={cn("transition-transform", tagsExpanded && "rotate-180")} />
           </button>
           {tagsExpanded && (
             <div className="flex flex-wrap gap-1">
-              {activeTag && (
+              {(activeTag || excludedTags.size > 0) && (
                 <button
-                  onClick={() => setActiveTag(null)}
+                  onClick={clearTagFilters}
                   className="flex items-center gap-1 rounded-full bg-[var(--destructive)]/10 px-2 py-0.5 text-[0.625rem] font-medium text-[var(--destructive)] transition-all hover:bg-[var(--destructive)]/20"
                 >
                   <X size="0.5rem" /> Clear
                 </button>
               )}
-              {allTags.map((tag) => (
-                <div
-                  key={tag}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => setActiveTag(activeTag === tag ? null : tag)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setActiveTag(activeTag === tag ? null : tag);
-                    }
-                  }}
-                  className={cn(
-                    "group/tag flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-all cursor-pointer",
-                    activeTag === tag
-                      ? "bg-[var(--primary)]/20 text-[var(--primary)] ring-1 ring-[var(--primary)]/30"
-                      : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
-                  )}
-                >
-                  <Tag size="0.5rem" />
-                  {tag}
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleDeleteTag(tag);
+              {allTags.map((tag) => {
+                const included = activeTag === tag;
+                const excluded = excludedTags.has(tag);
+                return (
+                  <div
+                    key={tag}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => toggleIncludedTag(tag)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        toggleIncludedTag(tag);
+                      }
                     }}
-                    className="ml-0.5 rounded-full p-0.5 transition-colors hover:bg-[var(--destructive)]/20 hover:text-[var(--destructive)]"
-                    title={`Delete tag "${tag}"`}
+                    className={cn(
+                      "group/tag flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-all",
+                      included
+                        ? "bg-[var(--primary)]/20 text-[var(--primary)] ring-1 ring-[var(--primary)]/30"
+                        : excluded
+                          ? "bg-[var(--destructive)]/12 text-[var(--destructive)] ring-1 ring-[var(--destructive)]/25"
+                          : "bg-[var(--secondary)] text-[var(--muted-foreground)] hover:bg-[var(--accent)] hover:text-[var(--foreground)]",
+                    )}
                   >
-                    <X size="0.5rem" />
-                  </button>
-                </div>
-              ))}
+                    <Tag size="0.5rem" />
+                    {tag}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleExcludedTag(tag);
+                      }}
+                      className={cn(
+                        "ml-0.5 rounded-full p-0.5 transition-colors",
+                        excluded
+                          ? "bg-[var(--destructive)]/20 text-[var(--destructive)]"
+                          : "hover:bg-[var(--destructive)]/15 hover:text-[var(--destructive)]",
+                      )}
+                      title={excluded ? `Stop excluding "${tag}"` : `Exclude tag "${tag}"`}
+                    >
+                      <Minus size="0.5rem" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteTag(tag);
+                      }}
+                      className="rounded-full p-0.5 transition-colors hover:bg-[var(--destructive)]/20 hover:text-[var(--destructive)]"
+                      title={`Delete tag "${tag}"`}
+                    >
+                      <X size="0.5rem" />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -921,6 +968,25 @@ export function CharactersPanel() {
                               )}
                             </div>
                             <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const fullMember = parsedCharacters.find((c) => c.id === memberId);
+                                handleStartNewChat(
+                                  memberId,
+                                  member.name,
+                                  fullMember?.parsed?.first_mes as string | undefined,
+                                  (fullMember?.parsed?.alternate_greetings ?? []) as string[],
+                                );
+                              }}
+                              disabled={isStartingChat}
+                              className="rounded p-0.5 text-[var(--muted-foreground)] opacity-0 transition-all hover:bg-[var(--primary)]/10 hover:text-[var(--primary)] group-hover/member:opacity-100 disabled:cursor-not-allowed disabled:opacity-50 max-md:opacity-100"
+                              title="Start New Chat"
+                              aria-label={`Start New Chat with ${member.name}`}
+                            >
+                              <MessageCircle size="0.6875rem" />
+                            </button>
+                            <button
                               onClick={(e) => {
                                 e.stopPropagation();
                                 toggleGroupMember(group.id, memberId, group.memberIds);
@@ -993,7 +1059,7 @@ export function CharactersPanel() {
         {sortedCharacters.map((char) => {
           const charName = char.parsed.name ?? "Unnamed";
           const charTitle = getCharacterTitle({ name: charName, comment: char.comment });
-          const charTags = (char.parsed.tags ?? []) as string[];
+          const charTags = getCharacterTags(char);
           const charNameColor = (char.parsed.extensions?.nameColor as string) || undefined;
           const isSelected = chatCharacterIds.includes(char.id);
           const isBulkSelected = selectedCharacterIds.has(char.id);
@@ -1061,11 +1127,7 @@ export function CharactersPanel() {
                       src={avatarUrl}
                       alt={charName}
                       className="h-full w-full object-cover"
-                      style={getAvatarCropStyle(
-                        char.parsed.extensions?.avatarCrop as
-                          | { zoom: number; offsetX: number; offsetY: number }
-                          | undefined,
-                      )}
+                      style={getAvatarCropStyle(char.parsed.extensions?.avatarCrop as AvatarCropValue | undefined)}
                     />
                   </div>
                 ) : (
@@ -1125,7 +1187,7 @@ export function CharactersPanel() {
                         key={tag}
                         onClick={(e) => {
                           e.stopPropagation();
-                          setActiveTag(activeTag === tag ? null : tag);
+                          toggleIncludedTag(tag);
                         }}
                         className="cursor-pointer rounded-full bg-[var(--primary)]/8 px-1.5 py-px text-[0.5rem] font-medium text-[var(--primary)]/70 transition-all hover:bg-[var(--primary)]/15 hover:text-[var(--primary)]"
                       >
@@ -1215,10 +1277,9 @@ export function CharactersPanel() {
               label: "Quick Start Roleplay",
               icon: <Wand2 size="0.75rem" />,
               onSelect: () =>
-                quickStartFromCharacter(
+                handleStartNewChat(
                   contextMenu.charId,
                   contextMenu.charName,
-                  "roleplay",
                   contextMenu.firstMes,
                   contextMenu.altGreetings,
                 ),
@@ -1226,7 +1287,12 @@ export function CharactersPanel() {
             {
               label: "Quick Start Conversation",
               icon: <MessageCircle size="0.75rem" />,
-              onSelect: () => quickStartFromCharacter(contextMenu.charId, contextMenu.charName, "conversation"),
+              onSelect: () =>
+                startChatFromCharacter({
+                  characterId: contextMenu.charId,
+                  characterName: contextMenu.charName,
+                  mode: "conversation",
+                }),
             },
           ];
           return <ContextMenu x={contextMenu.x} y={contextMenu.y} items={items} onClose={() => setContextMenu(null)} />;

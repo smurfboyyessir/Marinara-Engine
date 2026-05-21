@@ -70,7 +70,7 @@ function redactSensitiveValue(value: unknown): unknown {
   return redacted;
 }
 
-function formatToolPayloadForLog(payload: string, maxLength = 400): string {
+export function formatToolPayloadForLog(payload: string, maxLength = 400): string {
   const truncate = (value: string) => (value.length > maxLength ? `${value.slice(0, maxLength)}...` : value);
   const scrubSensitiveText = (value: string) =>
     value
@@ -122,7 +122,11 @@ export async function executeAgent(
     const messages =
       config.type === "expression"
         ? buildExpressionAgentMessages(template, context)
-        : buildStandardAgentMessages(config, template, context);
+        : config.type === "knowledge-retrieval"
+          ? buildKnowledgeRetrievalAgentMessages(config, template, context)
+          : config.type === "spotify" && context.chatMode === "game"
+            ? buildGameSpotifyAgentMessages(template, context)
+            : buildStandardAgentMessages(config, template, context);
 
     // Agents use lower temperature for reliability
     const temperature = (config.settings.temperature as number) ?? 0.3;
@@ -316,6 +320,25 @@ export async function executeAgentBatch(
 ): Promise<AgentResult[]> {
   if (configs.length === 0) return [];
   const isolatedConfigs = configs.filter(shouldRunAgentIndividually);
+  if (isolatedConfigs.length === configs.length) {
+    logger.info(
+      "[agent-batch] Running %d isolated agent(s) individually: [%s]",
+      isolatedConfigs.length,
+      isolatedConfigs.map((c) => c.type).join(", "),
+    );
+    const isolatedSettled = await Promise.allSettled(
+      isolatedConfigs.map((config) => executeAgent(config, context, provider, model)),
+    );
+    return isolatedSettled.map((entry, index) =>
+      entry.status === "fulfilled"
+        ? entry.value
+        : makeError(
+            isolatedConfigs[index]!,
+            entry.reason instanceof Error ? entry.reason.message : "Agent execution failed",
+            Date.now(),
+          ),
+    );
+  }
   if (isolatedConfigs.length > 0 && isolatedConfigs.length < configs.length) {
     logger.info(
       "[agent-batch] Running %d compact agent(s) outside batch: [%s]",
@@ -591,7 +614,9 @@ function makeError(config: AgentExecConfig, error: string, startTime: number): A
 }
 
 function shouldRunAgentIndividually(config: Pick<AgentExecConfig, "type">): boolean {
-  return config.type === "expression";
+  // These agents either need compact prompts or carry large private extras that
+  // must not be merged into unrelated batched agent requests.
+  return config.type === "expression" || config.type === "lorebook-keeper";
 }
 
 function buildStandardAgentMessages(config: AgentExecConfig, template: string, context: AgentContext): ChatMessage[] {
@@ -618,6 +643,75 @@ function buildStandardAgentMessages(config: AgentExecConfig, template: string, c
   return buildAgentMessages(systemParts.join("\n"), context, config.type, agentContextSize);
 }
 
+export function buildKnowledgeRetrievalAgentMessagesForTest(
+  config: AgentExecConfig,
+  template: string,
+  context: AgentContext,
+): ChatMessage[] {
+  return buildKnowledgeRetrievalAgentMessages(config, template, context);
+}
+
+function buildKnowledgeRetrievalAgentMessages(
+  config: AgentExecConfig,
+  template: string,
+  context: AgentContext,
+): ChatMessage[] {
+  const systemParts: string[] = [];
+  systemParts.push(`<role>`);
+  systemParts.push(
+    `You are a specialized knowledge retrieval agent. Extract relevant facts from source material; do not roleplay, continue the conversation, write dialogue, or answer as any character.`,
+  );
+  systemParts.push(`</role>`);
+  systemParts.push(``);
+  systemParts.push(`<agents>`);
+  systemParts.push(template);
+  systemParts.push(`</agents>`);
+  const extras = buildAgentExtras(context, [config.type]);
+  if (extras) {
+    systemParts.push(``);
+    systemParts.push(extras);
+  }
+
+  const agentContextSize = normalizeAgentContextSize(config.settings.contextSize);
+  const recent = context.recentMessages.slice(-agentContextSize).filter((message) => message.content.trim());
+  const userParts: string[] = [];
+
+  if (recent.length > 0) {
+    userParts.push(`<conversation_messages>`);
+    for (const message of recent) {
+      const speaker = knowledgeRetrievalSpeakerLabel(message, context);
+      userParts.push(`${speaker}: ${truncateAgentText(message.content, 2000)}`);
+    }
+    userParts.push(`</conversation_messages>`);
+    userParts.push(``);
+  }
+
+  userParts.push(
+    `Use the conversation messages only to identify which source-material facts are relevant. Return a concise factual summary from <source_material>. If no source material is relevant, output: "No relevant information found."`,
+  );
+  userParts.push(`Now return the requested format.`);
+
+  return [
+    { role: "system", content: systemParts.join("\n"), contextKind: "prompt" },
+    { role: "user", content: userParts.join("\n"), contextKind: "history" },
+  ];
+}
+
+function knowledgeRetrievalSpeakerLabel(
+  message: { role: string; characterId?: string },
+  context: AgentContext,
+): string {
+  if (message.role === "user") return context.persona?.name?.trim() || "User";
+  if (message.role === "assistant") {
+    if (message.characterId) {
+      const character = context.characters.find((entry) => entry.id === message.characterId);
+      if (character?.name?.trim()) return character.name.trim();
+    }
+    return context.characters[0]?.name?.trim() || "Assistant";
+  }
+  return message.role || "Message";
+}
+
 function truncateAgentText(text: string, maxChars: number): string {
   const cleaned = stripHtmlTags(text);
   const chars = Array.from(cleaned);
@@ -638,6 +732,64 @@ function findLatestAssistantMessage(context: AgentContext): { index: number; con
     }
   }
   return null;
+}
+
+function findLatestUserMessage(context: AgentContext): { index: number; content: string } | null {
+  for (let index = context.recentMessages.length - 1; index >= 0; index--) {
+    const message = context.recentMessages[index]!;
+    if (message.role === "user" && message.content.trim()) {
+      return { index, content: message.content };
+    }
+  }
+  return null;
+}
+
+function buildGameSpotifyAgentMessages(template: string, context: AgentContext): ChatMessage[] {
+  const systemParts: string[] = [];
+  systemParts.push(`<role>`);
+  systemParts.push(`You are a specialized Spotify DJ agent for the current game turn.`);
+  systemParts.push(`</role>`);
+  systemParts.push(``);
+  systemParts.push(buildLoreBlock(context));
+  systemParts.push(``);
+  systemParts.push(`<agents>`);
+  systemParts.push(`Fulfill the requested task here and return the output in the format specified:`);
+  systemParts.push(template);
+  systemParts.push(`</agents>`);
+
+  const extras = buildAgentExtras(context, ["spotify"]);
+  if (extras) {
+    systemParts.push(``);
+    systemParts.push(extras);
+  }
+
+  const latestUser = findLatestUserMessage(context);
+  const latestGameTurn = context.mainResponse?.trim() || findLatestAssistantMessage(context)?.content || "";
+  const userParts: string[] = [];
+
+  if (latestUser?.content) {
+    userParts.push(`<last_user_input>`);
+    userParts.push(truncateAgentText(latestUser.content, 2000));
+    userParts.push(`</last_user_input>`);
+    userParts.push(``);
+  }
+
+  if (latestGameTurn) {
+    userParts.push(`<last_game_turn>`);
+    userParts.push(truncateAgentText(latestGameTurn, 5000));
+    userParts.push(`</last_game_turn>`);
+    userParts.push(``);
+  }
+
+  userParts.push(
+    `Pick music for this game turn only. Use tools to inspect playback and fetch/search candidate tracks.`,
+  );
+  userParts.push(`Now return the requested format.`);
+
+  return [
+    { role: "system", content: systemParts.join("\n"), contextKind: "prompt" },
+    { role: "user", content: userParts.join("\n"), contextKind: "history" },
+  ];
 }
 
 function buildExpressionAgentMessages(template: string, context: AgentContext): ChatMessage[] {
@@ -728,6 +880,12 @@ function buildAgentMessages(
   // ── 2. Chat history as proper multi-turn messages ──
   // Slice to this agent's own contextSize (the shared pool may be larger)
   const recent = context.recentMessages.slice(-contextSize);
+  // Text-output agents (director, prose-guardian) evaluate pacing/writing
+  // quality and do NOT need raw committed tracker JSON. Including it makes
+  // the input look like `[assistant] roleplay + <committed_tracker_state>{...}`
+  // — a pattern small/fine-tuned models mimic into their response, leaking
+  // roleplay and tracker JSON that gets injected into the main prompt.
+  const skipTrackerAppend = isTextOutputAgentType(agentType);
   if (recent.length > 0) {
     // Only attach committed tracker state to the last 3 assistant messages to save tokens
     const assistantIndices: number[] = [];
@@ -743,8 +901,9 @@ function buildAgentMessages(
       const role: "user" | "assistant" = msg.role === "assistant" ? "assistant" : "user";
       let content = stripHtmlTags(msg.content).slice(0, 2000);
 
-      // Append committed tracker data only to the last 3 assistant messages
-      if (msg.gameState && trackerEligible.has(msgIdx)) {
+      // Append committed tracker data only to the last 3 assistant messages,
+      // and only for agents whose output is structured (not text agents — see above).
+      if (!skipTrackerAppend && msg.gameState && trackerEligible.has(msgIdx)) {
         const gs = msg.gameState;
         const trackerSummary: Record<string, unknown> = {};
         if (gs.date || gs.time || gs.location || gs.weather || gs.temperature) {
@@ -784,6 +943,18 @@ function buildAgentMessages(
     finalParts.push(`</assistant_response>`);
   }
 
+  if (context.preGenInjections?.length) {
+    finalParts.push(`\n<pre_generation_injections>`);
+    finalParts.push(JSON.stringify(context.preGenInjections));
+    finalParts.push(`</pre_generation_injections>`);
+  }
+
+  if (context.parallelResults?.length) {
+    finalParts.push(`\n<parallel_agent_results>`);
+    finalParts.push(JSON.stringify(context.parallelResults));
+    finalParts.push(`</parallel_agent_results>`);
+  }
+
   if (context.memory._agentResults) {
     finalParts.push(`\n<agent_results>`);
     finalParts.push(JSON.stringify(context.memory._agentResults));
@@ -806,19 +977,12 @@ function buildAgentMessages(
 
 /**
  * Build the lore block for the system message from the agent context.
- * Contains lorebook entries, characters, and persona.
+ * Contains character and persona context. Runtime lorebook entries are
+ * intentionally excluded to keep non-lorebook agent prompts compact.
  */
 function buildLoreBlock(context: AgentContext): string {
   const parts: string[] = [];
   parts.push(`<lore>`);
-
-  if (context.activatedLorebookEntries && context.activatedLorebookEntries.length > 0) {
-    parts.push(`<lorebook_entries>`);
-    for (const entry of context.activatedLorebookEntries) {
-      parts.push(`[${entry.tag}] ${entry.name}: ${entry.content}`);
-    }
-    parts.push(`</lorebook_entries>`);
-  }
 
   if (context.characters.length > 0) {
     parts.push(`<characters>`);
@@ -867,10 +1031,12 @@ function buildAvailableSpritesBlock(context: AgentContext): string {
     characterId: string;
     characterName: string;
     expressions: string[];
+    expressionChoices?: string[];
   }>;
   const parts: string[] = [`<available_sprites>`];
   for (const char of sprites) {
-    parts.push(`${char.characterName} (${char.characterId}): ${char.expressions.join(", ")}`);
+    const choices = char.expressionChoices?.length ? char.expressionChoices : char.expressions;
+    parts.push(`${char.characterName} (${char.characterId}): ${choices.join(", ")}`);
   }
   parts.push(`</available_sprites>`);
   return parts.join("\n");
@@ -929,12 +1095,14 @@ function buildAgentExtras(context: AgentContext, agentTypes: string[] = []): str
       filename: string;
       originalName?: string | null;
       tags: string[];
+      source?: "user" | "game_asset";
     }>;
     parts.push(`<available_backgrounds>`);
     for (const bg of bgs) {
       const label = bg.originalName ? `${bg.filename} (${bg.originalName})` : bg.filename;
+      const source = bg.source === "game_asset" ? " [source: game asset]" : "";
       const tagStr = bg.tags.length > 0 ? ` [tags: ${bg.tags.join(", ")}]` : "";
-      parts.push(`- ${label}${tagStr}`);
+      parts.push(`- ${label}${source}${tagStr}`);
     }
     parts.push(`</available_backgrounds>`);
     if (context.memory._currentBackground) {
@@ -942,7 +1110,21 @@ function buildAgentExtras(context: AgentContext, agentTypes: string[] = []): str
     }
   }
 
-  if (context.memory._existingLorebookEntries) {
+  if (agentTypes.includes("background") && context.memory._backgroundGenerationEnabled === true) {
+    parts.push(`<background_generation enabled="true">`);
+    parts.push(
+      `If no listed background fits a changed or new location, request a generated reusable location background instead of forcing a weak match.`,
+    );
+    parts.push(`</background_generation>`);
+  }
+
+  if (agentTypes.includes("spotify") && context.memory._spotifyDjConstraints) {
+    parts.push(`<spotify_dj_constraints>`);
+    parts.push(JSON.stringify(context.memory._spotifyDjConstraints));
+    parts.push(`</spotify_dj_constraints>`);
+  }
+
+  if (agentTypes.includes("lorebook-keeper") && context.memory._existingLorebookEntries) {
     const rawEntries = context.memory._existingLorebookEntries as Array<
       string | { id?: string; name?: string; content?: string; keys?: string[]; locked?: boolean }
     >;
@@ -1008,12 +1190,6 @@ function buildAgentExtras(context: AgentContext, agentTypes: string[] = []): str
       parts.push(extractions[i]!);
     }
     parts.push(`</previous_extractions>`);
-  }
-
-  if (context.memory._knowledgeRetrievalMaterial) {
-    parts.push(`<knowledge_material>`);
-    parts.push(context.memory._knowledgeRetrievalMaterial as string);
-    parts.push(`</knowledge_material>`);
   }
 
   if (context.memory._connectedDevices) {
@@ -1116,6 +1292,20 @@ function agentResponseIsJson(config: Pick<AgentExecConfig, "type" | "settings">)
   return JSON_AGENTS.has(config.type) || !TEXT_RESULT_TYPES.has(resultType);
 }
 
+/**
+ * Whether a built-in agent type's primary output is plain text (director note,
+ * writing directives, etc.) rather than structured JSON. Used to suppress
+ * inputs/outputs that text agents may pattern-mimic into their response.
+ *
+ * Returns false for unknown types (custom agents, "__batch__"): the safe
+ * default keeps full context; tracker-leak sanitization runs on the output side.
+ */
+function isTextOutputAgentType(agentType: string): boolean {
+  const resultType = AGENT_RESULT_TYPE_MAP[agentType];
+  if (!resultType) return false;
+  return TEXT_RESULT_TYPES.has(resultType);
+}
+
 /** Agents that return structured JSON. */
 const JSON_AGENTS = new Set([
   "world-state",
@@ -1141,6 +1331,40 @@ const JSON_AGENTS = new Set([
 ]);
 
 /**
+ * Strip leaked synthetic tags from a text agent's response and, for the
+ * Narrative Director, extract only the canonical "[Director's note: ...]"
+ * payload its prompt mandates.
+ *
+ * Background: when a text agent (director, prose-guardian) is shown chat
+ * history that ends in `<committed_tracker_state>{...}</committed_tracker_state>`,
+ * smaller models will continue the pattern and emit roleplay + tracker JSON
+ * before/around their intended directive. That leaked content gets injected
+ * into the main prompt as a system block, then converted to a user message
+ * by `prepareProviderMessages`, causing the main AI to respond to the leak.
+ */
+function sanitizeTextAgentResponse(agentType: string, text: string): string {
+  const cleaned = text
+    .replace(/<committed_tracker_state>[\s\S]*?<\/committed_tracker_state>/gi, "")
+    .replace(/<assistant_response>[\s\S]*?<\/assistant_response>/gi, "")
+    .trim();
+
+  // Director output is locked to "[Director's note: ...]" by its prompt.
+  // Anything outside that bracket is leakage — extract the last note (most
+  // likely the model's "final" intent) and discard the rest. If no bracketed
+  // note is present at all, the response is fully off-format; drop it so the
+  // pipeline injects nothing rather than hallucinated roleplay.
+  if (agentType === "director") {
+    const noteMatches = cleaned.match(/\[Director(?:'|’)s note:[^\]]*\]/gi);
+    if (noteMatches && noteMatches.length > 0) {
+      return noteMatches[noteMatches.length - 1]!.trim();
+    }
+    return "";
+  }
+
+  return cleaned;
+}
+
+/**
  * Parse the raw LLM response into a typed result.
  */
 function parseAgentResponse(
@@ -1162,8 +1386,9 @@ function parseAgentResponse(
     }
   }
 
-  // Text-based agents (prose-guardian, director)
-  return { type: resultType, data: { text: responseText } };
+  // Text-based agents (prose-guardian, director). Sanitize before injection so
+  // leaked tracker/roleplay content can't reach the main prompt.
+  return { type: resultType, data: { text: sanitizeTextAgentResponse(config.type, responseText) } };
 }
 
 /** Extract JSON from a response that may contain markdown fences. */

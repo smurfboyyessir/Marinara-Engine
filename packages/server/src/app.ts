@@ -20,7 +20,7 @@ import { seedDefaultConnection } from "./db/seed-connection.js";
 import { seedDefaultBackgrounds } from "./db/seed-backgrounds.js";
 import { seedDefaultGameAssets } from "./db/seed-game-assets.js";
 import { seedDefaultRegexScripts } from "./db/seed-regex.js";
-import { buildAssetManifest } from "./services/game/asset-manifest.service.js";
+import { buildAssetManifest, ensureAssetDirs } from "./services/game/asset-manifest.service.js";
 import { recoverGalleryImages } from "./services/storage/gallery-recovery.js";
 import { APP_VERSION } from "@marinara-engine/shared";
 import { existsSync } from "fs";
@@ -28,13 +28,15 @@ import { basename, join, resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { getBuildCommit, getBuildLabel } from "./config/build-info.js";
 import {
-  getCorsConfig,
   getLogLevel,
   getNodeEnv,
+  isRequestLoggingDisabled,
   isFileStorageBackend,
   isAutoCreateDefaultConnectionDisabled,
 } from "./config/runtime-config.js";
+import { corsDelegate } from "./config/cors-config.js";
 import { sidecarProcessService } from "./services/sidecar/sidecar-process.service.js";
+import { startServerAutonomousScheduler } from "./services/conversation/server-autonomous-scheduler.service.js";
 
 const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 const REVALIDATE_FILES = new Set(["index.html"]);
@@ -42,18 +44,24 @@ const NO_STORE_FILES = new Set(["manifest.json", "sw.js", "registerSW.js"]);
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
 
 export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
-  const corsConfig = getCorsConfig();
   const app = Fastify({
     logger: {
       level: getLogLevel(),
       transport: getNodeEnv() !== "production" ? { target: "pino-pretty", options: { colorize: true } } : undefined,
     },
+    disableRequestLogging: isRequestLoggingDisabled,
     bodyLimit: MAX_UPLOAD_BYTES, // Large profile imports can include many base64 avatars.
     ...(https && { https }),
   });
 
   // ── Plugins ──
-  await app.register(cors, corsConfig);
+  // CORS uses a per-request delegator so the trusted set is re-read each
+  // request (CORS_ORIGINS hot-reloads in ~2s without a restart) AND so
+  // same-origin requests (Origin matches the request's Host header) are
+  // auto-allowed regardless of configuration. @fastify/cors expects the
+  // delegator to be returned from a factory function passed as the plugin
+  // options. See cors-config.ts.
+  await app.register(cors, () => corsDelegate);
 
   await app.register(multipart, {
     limits: {
@@ -91,7 +99,8 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   await seedDefaultBackgrounds();
   await seedDefaultGameAssets();
 
-  // ── Build game asset manifest (scans game-assets + user backgrounds) ──
+  // ── Ensure default asset directories exist, then build manifest ──
+  ensureAssetDirs();
   buildAssetManifest();
 
   // ── Recover orphaned gallery images (files on disk without DB records) ──
@@ -129,6 +138,9 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
 
   // ── Routes ──
   await registerRoutes(app);
+
+  // ── Server-side autonomous conversation scheduler ──
+  startServerAutonomousScheduler(app);
 
   // ── Sidecar bootstrap (background, skipped in lite mode) ──
   if (!isLite) {

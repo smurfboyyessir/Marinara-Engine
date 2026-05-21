@@ -25,6 +25,17 @@ export const PROVIDERS: Record<APIProvider, ProviderDefinition> = {
     usesAuthHeader: true,
     apiKeyHeader: null,
   },
+  openai_chatgpt: {
+    id: "openai_chatgpt",
+    name: "OpenAI (ChatGPT)",
+    // No user-entered endpoint or API key. Marinara reads the local Codex
+    // ChatGPT login and routes through ChatGPT's Codex backend.
+    defaultBaseUrl: "",
+    modelsEndpoint: "",
+    supportsStreaming: true,
+    usesAuthHeader: false,
+    apiKeyHeader: null,
+  },
   anthropic: {
     id: "anthropic",
     name: "Anthropic",
@@ -54,6 +65,15 @@ export const PROVIDERS: Record<APIProvider, ProviderDefinition> = {
     supportsStreaming: true,
     usesAuthHeader: false,
     apiKeyHeader: "x-goog-api-key",
+  },
+  google_vertex: {
+    id: "google_vertex",
+    name: "Google Vertex AI",
+    defaultBaseUrl: "https://us-central1-aiplatform.googleapis.com/v1/projects/YOUR_PROJECT_ID/locations/us-central1",
+    modelsEndpoint: "/publishers/google/models",
+    supportsStreaming: true,
+    usesAuthHeader: false,
+    apiKeyHeader: null,
   },
   mistral: {
     id: "mistral",

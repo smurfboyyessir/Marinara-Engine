@@ -79,6 +79,8 @@ export function createConnectionsStorage(db: DB) {
         useForRandom: String(input.useForRandom ?? false),
         defaultForAgents: String(input.defaultForAgents ?? false),
         enableCaching: String(input.enableCaching ?? false),
+        cachingAtDepth: input.cachingAtDepth ?? 5,
+        maxParallelJobs: input.maxParallelJobs ?? 1,
         embeddingModel: input.embeddingModel ?? "",
         embeddingBaseUrl: input.embeddingBaseUrl ?? "",
         embeddingConnectionId: input.embeddingConnectionId ?? null,
@@ -86,7 +88,10 @@ export function createConnectionsStorage(db: DB) {
         imageGenerationSource: input.imageGenerationSource ?? null,
         comfyuiWorkflow: input.comfyuiWorkflow ?? null,
         imageService: input.imageService ?? null,
+        imageEndpointId: input.imageEndpointId ?? null,
+        promptPresetId: input.promptPresetId ?? null,
         maxTokensOverride: input.maxTokensOverride ?? null,
+        claudeFastMode: String(input.claudeFastMode ?? false),
         createdAt: timestamp,
         updatedAt: timestamp,
       });
@@ -138,6 +143,9 @@ export function createConnectionsStorage(db: DB) {
       if (data.enableCaching !== undefined) {
         updateFields.enableCaching = String(data.enableCaching);
       }
+      if (data.cachingAtDepth !== undefined) {
+        updateFields.cachingAtDepth = data.cachingAtDepth;
+      }
       if (data.embeddingModel !== undefined) {
         updateFields.embeddingModel = data.embeddingModel;
       }
@@ -159,8 +167,20 @@ export function createConnectionsStorage(db: DB) {
       if (data.imageService !== undefined) {
         updateFields.imageService = data.imageService;
       }
+      if (data.imageEndpointId !== undefined) {
+        updateFields.imageEndpointId = data.imageEndpointId;
+      }
+      if (data.promptPresetId !== undefined) {
+        updateFields.promptPresetId = data.promptPresetId;
+      }
       if (data.maxTokensOverride !== undefined) {
         updateFields.maxTokensOverride = data.maxTokensOverride;
+      }
+      if (data.maxParallelJobs !== undefined) {
+        updateFields.maxParallelJobs = data.maxParallelJobs;
+      }
+      if (data.claudeFastMode !== undefined) {
+        updateFields.claudeFastMode = String(data.claudeFastMode);
       }
       await db.update(apiConnections).set(updateFields).where(eq(apiConnections.id, id));
       return this.getById(id);
@@ -184,6 +204,7 @@ export function createConnectionsStorage(db: DB) {
         useForRandom: source.useForRandom,
         defaultForAgents: "false",
         enableCaching: source.enableCaching,
+        cachingAtDepth: source.cachingAtDepth,
         embeddingModel: source.embeddingModel,
         embeddingConnectionId: source.embeddingConnectionId,
         defaultParameters: source.defaultParameters,
@@ -192,7 +213,11 @@ export function createConnectionsStorage(db: DB) {
         imageGenerationSource: source.imageGenerationSource,
         comfyuiWorkflow: source.comfyuiWorkflow,
         imageService: source.imageService,
+        imageEndpointId: source.imageEndpointId,
+        promptPresetId: source.promptPresetId,
         maxTokensOverride: source.maxTokensOverride,
+        maxParallelJobs: source.maxParallelJobs,
+        claudeFastMode: source.claudeFastMode,
         createdAt: timestamp,
         updatedAt: timestamp,
       });

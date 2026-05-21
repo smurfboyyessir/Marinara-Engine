@@ -9,6 +9,7 @@ import { z } from "zod";
 import { sidecarModelService } from "../services/sidecar/sidecar-model.service.js";
 import { mlxRuntimeService } from "../services/sidecar/mlx-runtime.service.js";
 import { sidecarRuntimeService } from "../services/sidecar/sidecar-runtime.service.js";
+import { getLocalSidecarProvider, LOCAL_SIDECAR_MODEL } from "../services/llm/local-sidecar.js";
 import {
   analyzeScene,
   isInferenceAvailable,
@@ -141,6 +142,37 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
+  const embeddingsBodySchema = z
+    .object({
+      input: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
+      model: z.string().trim().min(1).optional(),
+    })
+    .passthrough();
+
+  app.post("/v1/embeddings", async (req, reply) => {
+    const body = embeddingsBodySchema.parse(req.body ?? {});
+    const texts = Array.isArray(body.input) ? body.input : [body.input];
+    const model = body.model ?? LOCAL_SIDECAR_MODEL;
+
+    try {
+      const embeddings = await getLocalSidecarProvider().embed(texts, model);
+      return {
+        object: "list",
+        model,
+        data: embeddings.map((embedding, index) => ({
+          object: "embedding",
+          embedding,
+          index,
+        })),
+      };
+    } catch (error) {
+      logger.warn(error, "[sidecar] Embedding request failed");
+      return reply.status(502).send({
+        error: error instanceof Error ? error.message : "Local sidecar embedding request failed",
+      });
+    }
+  });
+
   app.post("/reinstall", async (req, reply) => {
     if (!requirePrivilegedAccess(req, reply, { feature: "Sidecar runtime reinstall" })) return;
     if (!isRuntimeInstallRequestAllowed(req)) {
@@ -266,12 +298,29 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
       currentBackground: z.string().nullable().optional(),
       currentMusic: z.string().nullable().optional(),
       recentMusic: z.array(z.string()).max(20).optional(),
+      useSpotifyMusic: z.boolean().optional(),
+      availableSpotifyTracks: z
+        .array(
+          z.object({
+            uri: z.string().min(1).max(300),
+            name: z.string().min(1).max(300),
+            artist: z.string().min(1).max(300),
+            album: z.string().max(300).nullable().optional(),
+            position: z.number().nullable().optional(),
+            score: z.number().nullable().optional(),
+          }),
+        )
+        .max(50)
+        .optional(),
+      currentSpotifyTrack: z.string().max(300).nullable().optional(),
+      recentSpotifyTracks: z.array(z.string().max(300)).max(20).optional(),
       currentAmbient: z.string().nullable().optional(),
       currentWeather: z.string().nullable().optional(),
       currentTimeOfDay: z.string().nullable().optional(),
       canGenerateBackgrounds: z.boolean().optional(),
       canGenerateIllustrations: z.boolean().optional(),
       artStylePrompt: z.string().nullable().optional(),
+      imagePromptInstructions: z.string().max(1200).nullable().optional(),
     }),
     debugMode: z.boolean().optional().default(false),
   });
@@ -321,6 +370,8 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
       const ppCtx: PostProcessContext = {
         availableBackgrounds: bgTags,
         availableSfx: sfxTags,
+        useSpotifyMusic: !!body.context.useSpotifyMusic,
+        availableSpotifyTracks: body.context.availableSpotifyTracks ?? [],
         canGenerateBackgrounds: !!body.context.canGenerateBackgrounds,
         validWidgetIds: new Set(
           (body.context.activeWidgets ?? [])
@@ -342,17 +393,21 @@ export const sidecarRoutes: FastifyPluginAsync = async (app) => {
       const musicTags = assetKeys.filter((key) => key.startsWith("music:"));
       const ambientTags = assetKeys.filter((key) => key.startsWith("ambient:"));
 
-      const scoredMusic = scoreMusic({
-        state: (body.context.currentState as GameActiveState) ?? "exploration",
-        weather: result.weather ?? body.context.currentWeather ?? null,
-        timeOfDay: result.timeOfDay ?? body.context.currentTimeOfDay ?? null,
-        musicGenre: result.musicGenre,
-        musicIntensity: result.musicIntensity,
-        currentMusic: body.context.currentMusic ?? null,
-        recentMusic: body.context.recentMusic ?? null,
-        availableMusic: musicTags,
-      });
-      result.music = scoredMusic ?? null;
+      if (body.context.useSpotifyMusic) {
+        result.music = null;
+      } else {
+        const scoredMusic = scoreMusic({
+          state: (body.context.currentState as GameActiveState) ?? "exploration",
+          weather: result.weather ?? body.context.currentWeather ?? null,
+          timeOfDay: result.timeOfDay ?? body.context.currentTimeOfDay ?? null,
+          musicGenre: result.musicGenre,
+          musicIntensity: result.musicIntensity,
+          currentMusic: body.context.currentMusic ?? null,
+          recentMusic: body.context.recentMusic ?? null,
+          availableMusic: musicTags,
+        });
+        result.music = scoredMusic ?? null;
+      }
 
       const scoredAmbient = scoreAmbient({
         state: (body.context.currentState as GameActiveState) ?? "exploration",
